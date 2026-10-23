@@ -1,0 +1,25 @@
+{
+  "id": "/",
+  "name": "Velari Market",
+  "short_name": "Velari",
+  "description": "Premium elektronika do'koni",
+  "start_url": "/?utm_source=pwa",
+  "display": "standalone",
+  "background_color": "#FAFAF6",
+  "theme_color": "#2D6E3E",
+  "icons": [
+    {
+      "src": "/icons/icon-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "scope": "/"
+}
