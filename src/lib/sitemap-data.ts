@@ -28,8 +28,8 @@ const PRODUCT_DRIVEN_PATHS = new Set(['', '/catalog']);
 export function isIndexableProduct(p: any): boolean {
     if (!p || p.is_deleted === true) return false;
 
-    const price = Number(p.price);
-    if (p.price === null || p.price === undefined || !Number.isFinite(price) || price <= 0) return false;
+    const price = Number(p.price || 0);
+    if (!Number.isFinite(price) || price < 0) return false;
 
     if (typeof p.image !== 'string' || p.image.trim() === '') return false;
 
