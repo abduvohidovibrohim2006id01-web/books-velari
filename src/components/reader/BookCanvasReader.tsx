@@ -280,14 +280,17 @@ export function BookCanvasReader({
     const [isFromCache, setIsFromCache] = useState<boolean>(false);
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-    // PDF Pages & View Mode
+    // PDF Pages, View Mode & Zoom
     const [currentPage, setCurrentPage] = useState<number>(1);
     const [totalPages, setTotalPages] = useState<number>(0);
     const [pageInputValue, setPageInputValue] = useState<string>("1");
     const [zoom, setZoom] = useState<number>(1.0);
-    const [isFitWidth, setIsFitWidth] = useState<boolean>(false); // false = Fit Page to screen (Best for realistic book view)
+    const [isFitWidth, setIsFitWidth] = useState<boolean>(false);
     const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
     const [isPageRendering, setIsPageRendering] = useState<boolean>(false);
+
+    // Realtime pinch visual scale (CSS transform during finger gesture)
+    const [pinchVisualScale, setPinchVisualScale] = useState<number>(1.0);
 
     // Responsive Spread & View Preferences
     const [isNarrowScreen, setIsNarrowScreen] = useState<boolean>(false);
@@ -302,8 +305,14 @@ export function BookCanvasReader({
     // Rendered Page Dimensions (for matching Inside Cover placeholders)
     const [renderedDims, setRenderedDims] = useState<{ width: number; height: number }>({ width: 440, height: 620 });
 
-    // Touch swipe refs
+    // Touch, Swipe, Double-Tap & Pinch Zoom refs
     const touchStartCoords = useRef<{ x: number; y: number } | null>(null);
+    const pendingScrollCenterRef = useRef<{ x: number; y: number } | null>(null);
+    const lastTapRef = useRef<{ time: number; x: number; y: number } | null>(null);
+    const isPinchingRef = useRef<boolean>(false);
+    const pinchStartDistRef = useRef<number>(0);
+    const pinchStartZoomRef = useRef<number>(1.0);
+    const pinchCurrentFactorRef = useRef<number>(1.0);
 
     // ------------------------------------------------------------------------
     // Screen size watcher for responsive spread (Narrow < 860px)
@@ -660,6 +669,21 @@ export function BookCanvasReader({
             try {
                 localStorage.setItem(`book_page_${productId}`, String(currentPage));
             } catch (_) {}
+
+            // Smoothly align scroll after double-tap zoom to focus on tapped paragraph
+            if (pendingScrollCenterRef.current && scrollContainerRef.current) {
+                const { x, y } = pendingScrollCenterRef.current;
+                setTimeout(() => {
+                    if (scrollContainerRef.current) {
+                        scrollContainerRef.current.scrollTo({
+                            left: Math.max(0, x),
+                            top: Math.max(0, y),
+                            behavior: "smooth",
+                        });
+                    }
+                }, 50);
+                pendingScrollCenterRef.current = null;
+            }
         } catch (err: any) {
             if (err?.name !== "RenderingCancelledException") {
                 console.error("[BookCanvasReader] Render spread error:", err);
@@ -757,20 +781,66 @@ export function BookCanvasReader({
         }
     };
 
-    // Zoom Actions
+    // ------------------------------------------------------------------------
+    // 5. Zoom & Reading Comfort Controls
+    // ------------------------------------------------------------------------
     const handleZoomIn = () => {
         setIsFitWidth(false);
-        setZoom((prev) => Math.min(2.5, +(prev + 0.2).toFixed(2)));
+        setZoom((prev) => Math.min(3.0, +(prev + 0.25).toFixed(2)));
     };
 
     const handleZoomOut = () => {
         setIsFitWidth(false);
-        setZoom((prev) => Math.max(0.6, +(prev - 0.2).toFixed(2)));
+        setZoom((prev) => Math.max(0.6, +(prev - 0.25).toFixed(2)));
     };
 
     const handleToggleFitWidth = () => {
-        setIsFitWidth((prev) => !prev);
+        if (isFitWidth) {
+            setIsFitWidth(false);
+            setZoom(1.0);
+        } else if (zoom !== 1.0) {
+            // Agar zoom qilingan bo'lsa, bosganda 1.0x ga reset bo'ladi
+            setZoom(1.0);
+            setIsFitWidth(false);
+        } else {
+            setIsFitWidth(true);
+        }
     };
+
+    // Double-Tap / Double-Click Zoom (harflarni 1.9x ga kattalashtirish yoki 1.0x ga qaytarish)
+    const handleDoubleTapZoom = useCallback((clientX: number, clientY: number) => {
+        if (status !== "ready") return;
+        const container = scrollContainerRef.current;
+        if (!container) return;
+
+        if (zoom > 1.25) {
+            // Normal 1.0x holatiga qaytarish
+            setZoom(1.0);
+            setIsFitWidth(false);
+            container.scrollTo({ top: 0, behavior: "smooth" });
+        } else {
+            // Harflarni qulay o'qish uchun 1.9x ga kattalashtirish va bosilgan nuqtani markazga olish
+            const targetZoom = 1.9;
+            const rect = container.getBoundingClientRect();
+            const clickRelX = clientX - rect.left;
+            const clickRelY = clientY - rect.top;
+
+            const currentContentX = container.scrollLeft + clickRelX;
+            const currentContentY = container.scrollTop + clickRelY;
+
+            const scaleRatio = targetZoom / zoom;
+            const targetScrollLeft = currentContentX * scaleRatio - (rect.width / 2);
+            const targetScrollTop = currentContentY * scaleRatio - (rect.height / 2);
+
+            pendingScrollCenterRef.current = {
+                x: Math.max(0, targetScrollLeft),
+                y: Math.max(0, targetScrollTop),
+            };
+
+            setIsFitWidth(false);
+            setZoom(targetZoom);
+        }
+    }, [status, zoom]);
 
     // View Mode Toggle (Double vs Single)
     const toggleViewMode = () => {
@@ -862,8 +932,25 @@ export function BookCanvasReader({
         };
     }, [goToPrevPage, goToNextPage, onClose]);
 
-    // Touch Swipe Navigation for mobile & tablet
+    // ------------------------------------------------------------------------
+    // Touch Events: Double-Tap, Pinch-to-Zoom & Swipe Navigation
+    // ------------------------------------------------------------------------
     const handleTouchStart = (e: React.TouchEvent) => {
+        // 2 barmoq: Pinch Zoom boshlanishi
+        if (e.touches.length === 2) {
+            isPinchingRef.current = true;
+            const dist = Math.hypot(
+                e.touches[0].clientX - e.touches[1].clientX,
+                e.touches[0].clientY - e.touches[1].clientY
+            );
+            pinchStartDistRef.current = dist;
+            pinchStartZoomRef.current = zoom;
+            pinchCurrentFactorRef.current = 1.0;
+            touchStartCoords.current = null;
+            return;
+        }
+
+        // 1 barmoq: Swipe koordinatasi va Double-Tap hisobi
         if (e.touches.length === 1) {
             touchStartCoords.current = {
                 x: e.touches[0].clientX,
@@ -872,14 +959,68 @@ export function BookCanvasReader({
         }
     };
 
+    const handleTouchMove = (e: React.TouchEvent) => {
+        // Pinch harakati davom etmoqda (60 FPS smooth visual feedback)
+        if (isPinchingRef.current && e.touches.length === 2) {
+            const dist = Math.hypot(
+                e.touches[0].clientX - e.touches[1].clientX,
+                e.touches[0].clientY - e.touches[1].clientY
+            );
+            if (pinchStartDistRef.current > 0) {
+                const factor = dist / pinchStartDistRef.current;
+                pinchCurrentFactorRef.current = factor;
+                setPinchVisualScale(factor);
+            }
+        }
+    };
+
     const handleTouchEnd = (e: React.TouchEvent) => {
-        if (!touchStartCoords.current) return;
+        // Pinch tugashi: Barmoqlar ko'tarilganda yangi aniq PDF zoom o'rnatiladi
+        if (isPinchingRef.current) {
+            isPinchingRef.current = false;
+            const finalFactor = pinchCurrentFactorRef.current;
+            setPinchVisualScale(1.0);
+            pinchCurrentFactorRef.current = 1.0;
+
+            if (Math.abs(finalFactor - 1.0) > 0.08) {
+                setIsFitWidth(false);
+                const newZoom = Math.min(3.0, Math.max(0.6, +(pinchStartZoomRef.current * finalFactor).toFixed(2)));
+                setZoom(newZoom);
+            }
+            touchStartCoords.current = null;
+            return;
+        }
+
+        // Double-Tap detektori (mobil qurilmalar uchun)
         const touch = e.changedTouches[0];
+        if (touch) {
+            const now = Date.now();
+            if (lastTapRef.current && now - lastTapRef.current.time < 320) {
+                const dx = Math.abs(touch.clientX - lastTapRef.current.x);
+                const dy = Math.abs(touch.clientY - lastTapRef.current.y);
+                if (dx < 40 && dy < 40) {
+                    // Double Tap muvaffaqiyatli aniqlandi!
+                    handleDoubleTapZoom(touch.clientX, touch.clientY);
+                    lastTapRef.current = null;
+                    touchStartCoords.current = null;
+                    return;
+                }
+            }
+            lastTapRef.current = { time: now, x: touch.clientX, y: touch.clientY };
+        }
+
+        // Swipe varaqlash (Faqat normal zoomda — kattalashgan matnni o'qish paytida to'sqinlik qilmasligi uchun)
+        if (!touchStartCoords.current || !touch) return;
         const diffX = touch.clientX - touchStartCoords.current.x;
         const diffY = touch.clientY - touchStartCoords.current.y;
         touchStartCoords.current = null;
 
-        // Minimum swipe distance 50px, horizontal dominance
+        // Agar zoom qilingan bo'lsa (zoom > 1.2), foydalanuvchi matnni bemalol skroll qilib o'qiydi
+        if (zoom > 1.2) {
+            return;
+        }
+
+        // Minimum swipe masofasi 50px, gorizontal harakat dominant
         if (Math.abs(diffX) > 50 && Math.abs(diffX) > Math.abs(diffY) * 1.4) {
             if (diffX < 0) {
                 goToNextPage();
@@ -985,11 +1126,11 @@ export function BookCanvasReader({
             {/* =============================================================== */}
             {/* TOP HEADER BAR */}
             {/* =============================================================== */}
-            <header className="h-14 sm:h-16 bg-[#161E17]/95 backdrop-blur-md border-b border-white/10 px-3 sm:px-5 flex items-center justify-between gap-2 shrink-0 shadow-lg z-30">
+            <header className="h-14 sm:h-16 bg-[#161E17]/95 backdrop-blur-md border-b border-white/10 px-2 sm:px-5 flex items-center justify-between gap-1.5 sm:gap-2 shrink-0 shadow-lg z-30">
                 {/* Left: Book Icon & Title */}
-                <div className="flex items-center gap-2 sm:gap-3 min-w-0 max-w-[35%] sm:max-w-xs md:max-w-sm lg:max-w-md">
-                    <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-emerald-500/15 text-emerald-400 flex items-center justify-center shrink-0 border border-emerald-500/25 shadow-sm">
-                        <BookOpen size={18} strokeWidth={2.4} />
+                <div className="flex items-center gap-1.5 sm:gap-3 min-w-0 max-w-[28%] sm:max-w-xs md:max-w-sm">
+                    <div className="w-7 h-7 sm:w-9 sm:h-9 rounded-xl bg-emerald-500/15 text-emerald-400 flex items-center justify-center shrink-0 border border-emerald-500/25 shadow-sm">
+                        <BookOpen size={16} className="sm:w-[18px] sm:h-[18px]" strokeWidth={2.4} />
                     </div>
                     <div className="min-w-0">
                         <h2
@@ -998,13 +1139,13 @@ export function BookCanvasReader({
                         >
                             {bookTitle}
                         </h2>
-                        <div className="flex items-center gap-2 text-[10px] sm:text-[11px] font-medium text-emerald-400 mt-0.5">
+                        <div className="flex items-center gap-2 text-[9px] sm:text-[11px] font-medium text-emerald-400 mt-0.5">
                             <span className="flex items-center gap-1">
                                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                                {language === "uz" ? "Haqiqiy kitob mutolaasi" : "Книжный ридер"}
+                                <span className="hidden xs:inline">{language === "uz" ? "Kitob mutolaasi" : "Книжный ридер"}</span>
                             </span>
                             {isFromCache && (
-                                <span className="hidden sm:inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded-full bg-emerald-500/20 text-emerald-300 text-[9px] font-semibold">
+                                <span className="hidden md:inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded-full bg-emerald-500/20 text-emerald-300 text-[9px] font-semibold">
                                     <Zap size={10} className="text-yellow-400 fill-yellow-400" />
                                     {language === "uz" ? "Keshdan" : "Кэш"}
                                 </span>
@@ -1015,7 +1156,7 @@ export function BookCanvasReader({
 
                 {/* Center: Page Navigation (Only shown when ready) */}
                 {status === "ready" && totalPages > 0 && (
-                    <div className="flex items-center gap-1 sm:gap-1.5 bg-black/35 border border-white/10 rounded-xl px-1.5 py-1 sm:px-2 shadow-inner">
+                    <div className="flex items-center gap-0.5 sm:gap-1.5 bg-black/35 border border-white/10 rounded-xl px-1 py-0.5 sm:px-2 sm:py-1 shadow-inner">
                         <button
                             onClick={goToPrevPage}
                             disabled={currentPage <= 1 || isFlipping}
@@ -1023,10 +1164,10 @@ export function BookCanvasReader({
                             title={language === "uz" ? "Oldingi sahifa (ArrowLeft)" : "Предыдущая (ArrowLeft)"}
                             aria-label="Previous Page"
                         >
-                            <ChevronLeft size={17} strokeWidth={2.5} />
+                            <ChevronLeft size={16} className="sm:w-[17px] sm:h-[17px]" strokeWidth={2.5} />
                         </button>
 
-                        <form onSubmit={handlePageInputSubmit} className="flex items-center gap-1 text-xs font-semibold px-0.5">
+                        <form onSubmit={handlePageInputSubmit} className="flex items-center gap-0.5 sm:gap-1 text-xs font-semibold px-0.5">
                             <input
                                 type="text"
                                 inputMode="numeric"
@@ -1034,7 +1175,7 @@ export function BookCanvasReader({
                                 value={pageInputValue}
                                 onChange={(e) => setPageInputValue(e.target.value)}
                                 onBlur={handlePageInputSubmit}
-                                className="w-8 sm:w-11 text-center bg-black/50 border border-white/20 rounded-md py-0.5 text-xs font-bold text-white focus:outline-none focus:border-emerald-500 transition-colors"
+                                className="w-7 sm:w-11 text-center bg-black/50 border border-white/20 rounded-md py-0.5 text-xs font-bold text-white focus:outline-none focus:border-emerald-500 transition-colors"
                             />
                             <span className="text-gray-400">/</span>
                             <span className="text-gray-200 text-xs">{totalPages}</span>
@@ -1047,18 +1188,57 @@ export function BookCanvasReader({
                             title={language === "uz" ? "Keyingi sahifa (ArrowRight)" : "Следующая (ArrowRight)"}
                             aria-label="Next Page"
                         >
-                            <ChevronRight size={17} strokeWidth={2.5} />
+                            <ChevronRight size={16} className="sm:w-[17px] sm:h-[17px]" strokeWidth={2.5} />
                         </button>
                     </div>
                 )}
 
-                {/* Right: Controls & Options */}
+                {/* Right: Controls, Zoom & Options */}
                 <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+                    {/* ZOOM BOSHQRUVI: +, -, Fit Width (Mobil, planshet va kompyuterda ko'rinadi) */}
+                    {status === "ready" && (
+                        <div className="flex items-center gap-0.5 bg-black/40 border border-white/10 rounded-xl p-0.5 shadow-inner">
+                            <button
+                                onClick={handleZoomOut}
+                                className="p-1 sm:p-1.5 rounded-lg text-gray-300 hover:text-white hover:bg-white/10 active:scale-95 transition-colors"
+                                title={language === "uz" ? "Kichraytirish (-)" : "Уменьшить (-)"}
+                                aria-label="Zoom Out"
+                            >
+                                <ZoomOut size={14} />
+                            </button>
+                            <button
+                                onClick={handleToggleFitWidth}
+                                className={`px-1.5 sm:px-2 py-1 rounded-lg text-[10px] sm:text-[11px] font-bold transition-colors ${
+                                    isFitWidth
+                                        ? "bg-emerald-600 text-white shadow-sm"
+                                        : zoom > 1.15
+                                            ? "bg-emerald-500/25 text-emerald-300 font-extrabold"
+                                            : "text-gray-300 hover:text-white"
+                                }`}
+                                title={
+                                    language === "uz"
+                                        ? "Kenglikka moslash / Kattalashtirish (Bosing: 100% ga qaytaradi)"
+                                        : "По ширине / Масштаб"
+                                }
+                            >
+                                {isFitWidth ? (language === "uz" ? "Kenglik" : "Ширина") : `${Math.round(zoom * 100)}%`}
+                            </button>
+                            <button
+                                onClick={handleZoomIn}
+                                className="p-1 sm:p-1.5 rounded-lg text-gray-300 hover:text-white hover:bg-white/10 active:scale-95 transition-colors"
+                                title={language === "uz" ? "Kattalashtirish (+)" : "Увеличить (+)"}
+                                aria-label="Zoom In"
+                            >
+                                <ZoomIn size={14} />
+                            </button>
+                        </div>
+                    )}
+
                     {/* View Mode Switcher: 2 Pages (Book) vs 1 Page (Single) */}
                     {status === "ready" && !isNarrowScreen && (
                         <button
                             onClick={toggleViewMode}
-                            className="px-2 py-1.5 sm:px-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-gray-200 hover:text-white text-xs font-medium flex items-center gap-1.5 active:scale-95 transition-all"
+                            className="hidden md:flex px-2 py-1.5 sm:px-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-gray-200 hover:text-white text-xs font-medium items-center gap-1.5 active:scale-95 transition-all"
                             title={
                                 viewMode === "double"
                                     ? language === "uz" ? "Yakka sahifa rejimiga o'tish" : "Перейти в одну страницу"
@@ -1085,7 +1265,7 @@ export function BookCanvasReader({
 
                     {/* Paper Theme Picker: Sepia, White, Night */}
                     {status === "ready" && (
-                        <div className="flex items-center gap-0.5 bg-black/40 border border-white/10 rounded-xl p-0.5 sm:p-1">
+                        <div className="flex items-center gap-0.5 bg-black/40 border border-white/10 rounded-xl p-0.5">
                             <button
                                 onClick={() => handleSetTheme("sepia")}
                                 className={`px-1.5 sm:px-2 py-1 rounded-lg text-[10px] sm:text-[11px] font-bold flex items-center gap-1 transition-all ${
@@ -1096,7 +1276,7 @@ export function BookCanvasReader({
                                 title={language === "uz" ? "Kitob qog'ozi (Issiq Sepia)" : "Книжная бумага (Сепия)"}
                             >
                                 <span className="w-2.5 h-2.5 rounded-full bg-[#E5D7BC] border border-[#AFA085]" />
-                                <span className="hidden md:inline">{language === "uz" ? "Sepia" : "Сепия"}</span>
+                                <span className="hidden lg:inline">{language === "uz" ? "Sepia" : "Сепия"}</span>
                             </button>
                             <button
                                 onClick={() => handleSetTheme("white")}
@@ -1108,7 +1288,7 @@ export function BookCanvasReader({
                                 title={language === "uz" ? "Oq qog'oz" : "Белая бумага"}
                             >
                                 <Sun size={12} className={paperTheme === "white" ? "text-amber-500" : "text-gray-400"} />
-                                <span className="hidden md:inline">{language === "uz" ? "Oq" : "Белая"}</span>
+                                <span className="hidden lg:inline">{language === "uz" ? "Oq" : "Белая"}</span>
                             </button>
                             <button
                                 onClick={() => handleSetTheme("night")}
@@ -1120,7 +1300,7 @@ export function BookCanvasReader({
                                 title={language === "uz" ? "Tungi rejim" : "Ночной режим"}
                             >
                                 <Moon size={12} className={paperTheme === "night" ? "text-indigo-300" : "text-gray-400"} />
-                                <span className="hidden md:inline">{language === "uz" ? "Tungi" : "Ночь"}</span>
+                                <span className="hidden lg:inline">{language === "uz" ? "Tungi" : "Ночь"}</span>
                             </button>
                         </div>
                     )}
@@ -1129,7 +1309,7 @@ export function BookCanvasReader({
                     {status === "ready" && (
                         <button
                             onClick={toggleSound}
-                            className={`p-2 rounded-xl border border-white/10 active:scale-95 transition-all ${
+                            className={`p-1.5 sm:p-2 rounded-xl border border-white/10 active:scale-95 transition-all ${
                                 isSoundEnabled
                                     ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
                                     : "bg-white/5 text-gray-400 hover:text-white"
@@ -1139,46 +1319,16 @@ export function BookCanvasReader({
                                     ? language === "uz" ? "Varaqlash tovushi: Yoqiq" : "Звук страниц: Вкл"
                                     : language === "uz" ? "Varaqlash tovushi: O'chiq" : "Звук страниц: Выкл"
                             }
+                            aria-label="Toggle Sound"
                         >
                             {isSoundEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
                         </button>
                     )}
 
-                    {/* Zoom Controls (Desktop only) */}
-                    {status === "ready" && (
-                        <div className="hidden xl:flex items-center gap-0.5 bg-black/40 border border-white/10 rounded-xl p-0.5">
-                            <button
-                                onClick={handleZoomOut}
-                                className="p-1.5 rounded-lg text-gray-300 hover:text-white hover:bg-white/10 active:scale-95 transition-colors"
-                                title={language === "uz" ? "Kichraytirish (-)" : "Уменьшить (-)"}
-                            >
-                                <ZoomOut size={14} />
-                            </button>
-                            <button
-                                onClick={handleToggleFitWidth}
-                                className={`px-2 py-1 rounded-lg text-[10px] font-bold transition-colors ${
-                                    isFitWidth
-                                        ? "bg-emerald-600 text-white"
-                                        : "text-gray-300 hover:text-white"
-                                }`}
-                                title={language === "uz" ? "Kenglikka moslash" : "По ширине"}
-                            >
-                                {isFitWidth ? (language === "uz" ? "Kenglik" : "Ширина") : `${Math.round(zoom * 100)}%`}
-                            </button>
-                            <button
-                                onClick={handleZoomIn}
-                                className="p-1.5 rounded-lg text-gray-300 hover:text-white hover:bg-white/10 active:scale-95 transition-colors"
-                                title={language === "uz" ? "Kattalashtirish (+)" : "Увеличить (+)"}
-                            >
-                                <ZoomIn size={14} />
-                            </button>
-                        </div>
-                    )}
-
                     {/* Fullscreen Toggle */}
                     <button
                         onClick={toggleFullscreen}
-                        className="p-2 sm:px-2.5 sm:py-2 rounded-xl bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white text-xs font-medium flex items-center gap-1.5 active:scale-95 transition-colors"
+                        className="hidden sm:flex p-2 rounded-xl bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white text-xs font-medium items-center gap-1.5 active:scale-95 transition-colors"
                         title={
                             isFullscreen
                                 ? language === "uz" ? "Oyna rejimiga qaytish" : "Оконный режим"
@@ -1196,7 +1346,7 @@ export function BookCanvasReader({
                             }
                             onClose();
                         }}
-                        className="p-2 rounded-xl bg-white/10 hover:bg-red-500/80 active:scale-95 text-white flex items-center justify-center transition-colors ml-0.5"
+                        className="p-1.5 sm:p-2 rounded-xl bg-white/10 hover:bg-red-500/80 active:scale-95 text-white flex items-center justify-center transition-colors ml-0.5"
                         title={language === "uz" ? "Yopish (Esc)" : "Закрыть (Esc)"}
                     >
                         <X size={18} strokeWidth={2.4} />
@@ -1210,8 +1360,12 @@ export function BookCanvasReader({
             <main
                 ref={scrollContainerRef}
                 onTouchStart={handleTouchStart}
+                onTouchMove={handleTouchMove}
                 onTouchEnd={handleTouchEnd}
-                className="flex-1 w-full h-full relative overflow-auto flex flex-col items-center justify-start py-4 sm:py-6 px-2 sm:px-4"
+                onDoubleClick={(e) => handleDoubleTapZoom(e.clientX, e.clientY)}
+                className={`flex-1 w-full h-full relative overflow-auto flex flex-col items-center justify-start py-4 sm:py-6 px-2 sm:px-4 ${
+                    zoom > 1.25 ? "cursor-zoom-out" : "cursor-zoom-in"
+                }`}
                 style={{
                     WebkitOverflowScrolling: "touch",
                     perspective: "2200px",
@@ -1336,7 +1490,14 @@ export function BookCanvasReader({
 
                 {/* 3. READY STATE: REALISTIC TWO-PAGE BOOK SPREAD OR SINGLE PAGE */}
                 {status === "ready" && (
-                    <div className="relative my-auto flex flex-col items-center justify-center transition-all select-none">
+                    <div
+                        className="relative my-auto flex flex-col items-center justify-center transition-transform select-none"
+                        style={{
+                            transform: pinchVisualScale !== 1.0 ? `scale(${pinchVisualScale})` : undefined,
+                            transformOrigin: "center center",
+                            transition: isPinchingRef.current ? "none" : "transform 0.15s ease-out",
+                        }}
+                    >
                         {/* Rendering Spinner Overlay during page transitions */}
                         {isPageRendering && (
                             <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/20 backdrop-blur-[1px] rounded-lg transition-opacity pointer-events-none">
@@ -1344,6 +1505,15 @@ export function BookCanvasReader({
                                     <Loader2 size={16} className="animate-spin text-emerald-400" />
                                     <span>{language === "uz" ? "Sahifa ochilmoqda..." : "Листание страницы..."}</span>
                                 </div>
+                            </div>
+                        )}
+
+                        {/* Hint Pill for Double-Tap Zoom Comfort */}
+                        {zoom > 1.25 && (
+                            <div className="mb-2 sm:mb-3 px-3 py-1 rounded-full bg-black/60 border border-emerald-500/30 text-emerald-300 text-[10px] sm:text-xs font-medium shadow-lg backdrop-blur-md animate-in fade-in slide-in-from-top-2 duration-200">
+                                {language === "uz"
+                                    ? `🔍 Zoom: ${Math.round(zoom * 100)}% • Normal holatga qaytish uchun 2 marta bosing`
+                                    : `🔍 Масштаб: ${Math.round(zoom * 100)}% • Нажмите дважды для возврата`}
                             </div>
                         )}
 
@@ -1448,7 +1618,7 @@ export function BookCanvasReader({
                                                             <BookOpen size={32} className="text-emerald-400" />
                                                         )}
                                                     </div>
-                                                    <h3 className="text-base sm:text-lg font-bold text-white line-clamp-2">
+                                                    <h3 className="text-base sm:lg font-bold text-white line-clamp-2">
                                                         {bookTitle}
                                                     </h3>
                                                     <p className="text-[11px] sm:text-xs text-emerald-300/80 mt-2">
@@ -1615,7 +1785,7 @@ export function BookCanvasReader({
                             {getPageDisplayLabel()}
                         </span>
                         <div className="text-[10px] text-gray-400 block sm:hidden">
-                            {language === "uz" ? "Varaqlash uchun suring" : "Смахните для листания"}
+                            {language === "uz" ? "2 marta bosing: harflarni kattalashtirish" : "Дважды нажмите: увеличение"}
                         </div>
                     </div>
 
