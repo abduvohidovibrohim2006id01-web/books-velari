@@ -95,11 +95,16 @@ export async function GET(
                 return new Response("Kitobning PDF formati topilmadi", { status: 404 });
             }
 
-            fileName = selected.name;
+            const resolvedName = String(selected.name);
+            fileName = resolvedName;
             FILE_CACHE.set(archiveIdentifier, {
-                fileName,
+                fileName: resolvedName,
                 expires: now + 24 * 60 * 60 * 1000 // 24 soat
             });
+        }
+
+        if (!fileName) {
+            return new Response("Kitobning PDF formati topilmadi", { status: 404 });
         }
 
         // 3. Archive.org'dan PDF faylni oqim (stream) ko'rinishida olish
