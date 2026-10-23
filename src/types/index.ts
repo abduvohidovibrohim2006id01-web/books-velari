@@ -42,6 +42,8 @@ export interface Product {
     archive_identifier?: string;
     file_format?: string;
     file_size_mb?: number;
+    pdf_url?: string;
+    link?: string;
     image_metadata?: Record<string, { alt_uz?: string; alt_ru?: string; blurDataURL?: string; lowResUrl?: string; xs?: string; md?: string; lg?: string }>;
     created_at?: string;
     ai_persona?: {

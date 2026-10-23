@@ -1051,7 +1051,7 @@ export default function ProductClient({
                                 <button 
                                     onClick={() => {
                                         videoPreWarmer.triggerHaptic("medium");
-                                        const readUrl = product.archive_url || product.pdf_url || product.link;
+                                        const readUrl = product.archive_url || (product as any).pdf_url || (product as any).link;
                                         if (readUrl) {
                                             window.open(readUrl, "_blank");
                                         } else {
@@ -1213,7 +1213,7 @@ export default function ProductClient({
                     <button
                         onClick={() => {
                             videoPreWarmer.triggerHaptic("medium");
-                            const readUrl = product.archive_url || product.pdf_url || product.link;
+                            const readUrl = product.archive_url || (product as any).pdf_url || (product as any).link;
                             if (readUrl) {
                                 window.open(readUrl, "_blank");
                             } else {
