@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo, Suspense, startTransition } from "react";
 import Link from "next/link";
-import { Search, Sparkles, MapPin, ChevronRight, ChevronLeft, User, X, Loader2, LayoutGrid, Camera } from "lucide-react";
+import { Search, Sparkles, MapPin, ChevronRight, ChevronLeft, User, X, Loader2, LayoutGrid } from "lucide-react";
 import { useStore } from "@/store/store";
 import { useShallow } from "zustand/react/shallow";
 import { supabase } from "@/lib/supabase";
@@ -27,7 +27,7 @@ function UrlFilterReader({ onChange }: { onChange: (category: string | null, bra
 import { BannerSection } from "@/components/home/BannerSection";
 import { CategoryFilter } from "@/components/home/CategoryFilter";
 import { ProductGrid } from "@/components/home/ProductGrid";
-import TrustStrip from "@/components/velari/TrustStrip";
+
 import RecentlyViewed, { getRecentlyViewedIds } from "@/components/velari/RecentlyViewed";
 import PromoCountdown from "@/components/velari/PromoCountdown";
 import StoriesRow from "@/components/velari/StoriesRow";
@@ -664,23 +664,7 @@ export default function HomeClient({
                                 <X size={16} color="#9AA29C" />
                             </button>
                         )}
-                        <button
-                            type="button"
-                            aria-label={language === "uz" ? "Rasm orqali qidirish" : "Поиск по фото"}
-                            onClick={() => {
-                                videoPreWarmer.triggerHaptic("light");
-                                const navInput = document.getElementById("nav-visual-search-input") as HTMLInputElement;
-                                if (navInput) {
-                                    navInput.click();
-                                } else {
-                                    window.dispatchEvent(new CustomEvent("velari-trigger-visual-search"));
-                                }
-                            }}
-                            className="ios-icon-tap active:scale-85 transition-transform duration-150 p-1 text-[#2D6E3E] hover:bg-[#EAF3EC] rounded-xl shrink-0 flex items-center justify-center will-change-transform"
-                            title={language === "uz" ? "Rasm orqali qidirish" : "Поиск по фото"}
-                        >
-                            <Camera size={18} color="#2D6E3E" />
-                        </button>
+
                         <button
                             type="submit"
                             aria-label={language === "uz" ? "Qidirish" : "Искать"}
@@ -853,7 +837,7 @@ export default function HomeClient({
                 </div>
             )}
 
-            {!searchResults && !urlCategory && <Suspense fallback={null}><TrustStrip language={language} /></Suspense>}
+
 
             <div className="px-2 md:px-10 mt-4">
                 {searchResults && (

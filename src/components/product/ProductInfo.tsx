@@ -62,23 +62,15 @@ export const ProductInfo = ({
                 <span style={{ fontSize: 13, fontWeight: 500, color: "var(--velari-muted)" }}>
                     {(product.reviewCount || 0) > 0
                         ? `${(product.rating || 0).toFixed(1)} (${product.reviewCount} ${language === "uz" ? "sharh" : "отзыв"})`
-                        : (language === "uz" ? "Yangi mahsulot" : "Новый товар")}
+                        : (language === "uz" ? "Yangi kitob" : "Новая книга")}
                 </span>
             </div>
 
             {/* Price card -> Free status */}
             <div className="glass-card" style={{ padding: "16px 18px", marginBottom: 14 }}>
-                <span style={{ fontSize: 11, fontWeight: 600, color: "var(--velari-muted)", letterSpacing: 0.3, textTransform: "uppercase", display: "block", marginBottom: 4 }}>
-                    {language === "uz" ? "Kitob holati" : "Статус книги"}
+                <span style={{ fontSize: 26, fontWeight: 700, letterSpacing: -0.5, color: "#16A34A" }}>
+                    {language === "uz" ? "Bepul" : "Бесплатно"}
                 </span>
-                <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
-                    <span style={{ fontSize: 26, fontWeight: 700, letterSpacing: -0.5, color: "#16A34A" }}>
-                        {language === "uz" ? "Bepul mutolaa" : "Бесплатно"}
-                    </span>
-                    <span style={{ fontSize: 12, fontWeight: 600, color: "#64748B", background: "#F1F5F9", padding: "3px 9px", borderRadius: 8 }}>
-                        {language === "uz" ? "Ochiq elektron kutubxona" : "Открытый доступ"}
-                    </span>
-                </div>
             </div>
 
             {/* Variants / Group */}
@@ -109,17 +101,7 @@ export const ProductInfo = ({
                 </div>
             )}
 
-            {/* Stock */}
-            {totalStock > 0 && (
-                <div style={{ display: "flex", alignItems: "center", gap: 10, background: "#EAF3EC", borderRadius: 16, padding: "12px 14px", marginBottom: 10 }}>
-                    <div style={{ width: 28, height: 28, borderRadius: 9, background: GREEN, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                        <Check size={15} color="#fff" strokeWidth={3} />
-                    </div>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: "#1F5A30" }}>
-                        {language === "uz" ? "Omborda mavjud" : "В наличии"}: <strong style={{ fontWeight: 700 }}>{Number(totalStock)} {language === "uz" ? "ta" : "шт"}</strong>
-                    </span>
-                </div>
-            )}
+
 
             {/* Book Reading & Format - iOS Grouped Section */}
             <div className="ios-grouped-section" style={{ marginBottom: 16 }}>

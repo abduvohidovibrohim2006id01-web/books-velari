@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Search, Heart, ShoppingBag, MessageSquare, Clapperboard, LayoutGrid, User, ShoppingCart, BookOpen, Loader2, Sparkles, X, Home, Camera, MapPin, ChevronDown } from "lucide-react";
+import { Search, Heart, ShoppingBag, MessageSquare, Clapperboard, LayoutGrid, User, ShoppingCart, BookOpen, Loader2, Sparkles, X, Home, MapPin, ChevronDown } from "lucide-react";
 import Image from "next/image";
 import Logo from "./Logo";
 import LocationSelectModal from "@/components/modals/LocationSelectModal";
@@ -415,23 +415,7 @@ export default function Navigation() {
                                     <X size={18} />
                                 </button>
                             )}
-                            <button
-                                type="button"
-                                aria-label="Rasm orqali qidirish"
-                                onClick={() => fileInputRef.current?.click()}
-                                className="ios-icon-tap active:scale-85 transition-transform duration-150 p-2 text-gray-400 hover:text-[#2d6e3e] will-change-transform"
-                                title={language === "uz" ? "Rasm orqali qidirish" : "Поиск по фото"}
-                            >
-                                {isVisualSearching ? <Loader2 size={18} className="animate-spin text-[#2d6e3e]" /> : <Camera size={18} />}
-                            </button>
-                            <input
-                                ref={fileInputRef}
-                                id="nav-visual-search-input"
-                                type="file"
-                                accept="image/*"
-                                className="hidden"
-                                onChange={handleVisualSearch}
-                            />
+
                             <button
                                 type="submit"
                                 aria-label={t.common.search}

@@ -6,7 +6,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { supabase } from "@/lib/supabase";
 import { mapProduct, mapComment } from "@/lib/mappers";
 import { translations } from "@/lib/translations";
-import { Loader2, Plus, Minus, ShoppingBag, Heart, Star, Check, Truck, Clock, ShieldCheck, RefreshCw, Store as StoreIcon, ChevronRight, ChevronLeft, Maximize2, X, BookOpen, Download } from "lucide-react";
+import { Loader2, Plus, Minus, ShoppingBag, Heart, Star, Check, Truck, Clock, ShieldCheck, RefreshCw, Store as StoreIcon, ChevronRight, ChevronLeft, Maximize2, Minimize2, X, BookOpen, Download, ExternalLink } from "lucide-react";
 import Link from "next/link";
 import { getDeliveryDateText } from "@/lib/date-utils";
 import Image from "next/image";
@@ -138,6 +138,77 @@ export default function ProductClient({
     const [isDescriptionModalOpen, setIsDescriptionModalOpen] = useState(false);
     const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
     const [popularLoading, setPopularLoading] = useState(false);
+    const [isReaderOpen, setIsReaderOpen] = useState(false);
+    const [isReaderFullscreen, setIsReaderFullscreen] = useState(false);
+    const readerContainerRef = useRef<HTMLDivElement>(null);
+
+    const archiveId = useMemo(() => {
+        if (!product) return null;
+        if (product.archive_identifier) return product.archive_identifier;
+        if (product.archive_url) {
+            const match = product.archive_url.match(/archive\.org\/(?:details|embed)\/([^/?#]+)/i);
+            if (match) return match[1];
+        }
+        return null;
+    }, [product]);
+
+    const embedUrl = archiveId ? `https://archive.org/embed/${archiveId}` : null;
+    const directReadUrl = product?.archive_url || (archiveId ? `https://archive.org/details/${archiveId}` : (product as any)?.pdf_url || (product as any)?.link);
+
+    const handleOpenReader = useCallback(() => {
+        videoPreWarmer.triggerHaptic("medium");
+        if (embedUrl) {
+            setIsReaderOpen(true);
+        } else if (directReadUrl) {
+            window.open(directReadUrl, "_blank");
+        } else {
+            showToast(language === 'uz' ? "Mutolaa havolasi tayyorlanmoqda..." : "Ссылка формируется...");
+        }
+    }, [embedUrl, directReadUrl, language, showToast]);
+
+    const toggleReaderFullscreen = useCallback(() => {
+        if (!document.fullscreenElement) {
+            if (readerContainerRef.current?.requestFullscreen) {
+                readerContainerRef.current.requestFullscreen().catch(() => {});
+                setIsReaderFullscreen(true);
+            } else {
+                setIsReaderFullscreen(prev => !prev);
+            }
+        } else {
+            if (document.exitFullscreen) {
+                document.exitFullscreen().catch(() => {});
+                setIsReaderFullscreen(false);
+            }
+        }
+    }, []);
+
+    useEffect(() => {
+        const handleFullscreenChange = () => {
+            setIsReaderFullscreen(!!document.fullscreenElement);
+        };
+        document.addEventListener("fullscreenchange", handleFullscreenChange);
+        return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    }, []);
+
+    useEffect(() => {
+        if (!isReaderOpen) return;
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (e.key === "Escape") {
+                if (document.fullscreenElement) {
+                    document.exitFullscreen().catch(() => {});
+                }
+                setIsReaderOpen(false);
+                setIsReaderFullscreen(false);
+            }
+        };
+        window.addEventListener("keydown", handleKeyDown);
+        const origOverflow = document.body.style.overflow;
+        document.body.style.overflow = "hidden";
+        return () => {
+            window.removeEventListener("keydown", handleKeyDown);
+            document.body.style.overflow = origOverflow;
+        };
+    }, [isReaderOpen]);
     const [maxDesktopLoadIndex, setMaxDesktopLoadIndex] = useState(0);
 
     // Infinite scroll state
@@ -950,53 +1021,12 @@ export default function ProductClient({
                                 </div>
                             )}
 
-                             <div className="flex flex-col gap-1 mb-6">
-                                <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">{t.common.price}</p>
-                                {personalOffer ? (
-                                    // Shaxsiy chegirma: faqat 2 narx — eski narx (chizilgan) + shaxsiy narx. Oraliq narx yo'q.
-                                    <>
-                                        <div className="flex items-center gap-2 mb-1">
-                                            <span className="px-2 py-0.5 bg-indigo-600 text-white rounded-lg text-[10px] font-bold uppercase tracking-wider">-{personalOffer.percent}%</span>
-                                            <span className="text-[11px] font-semibold text-indigo-700">
-                                                {language === 'uz' ? 'Siz uchun shaxsiy narx' : 'Персональная цена для вас'}
-                                            </span>
-                                        </div>
-                                        <div className="flex items-baseline gap-4">
-                                            <div className="text-3xl lg:text-4xl font-bold tracking-tight text-indigo-700">
-                                                {Math.round(product.price * (1 - personalOffer.percent / 100)).toLocaleString()} <span className="text-xl font-normal text-indigo-600">{language === 'uz' ? "so'm" : "сум"}</span>
-                                            </div>
-                                            <span className="text-gray-300 line-through font-medium text-xl">
-                                                {Number((product.oldPrice && product.oldPrice > product.price ? product.oldPrice : product.price) || 0).toLocaleString()}
-                                            </span>
-                                        </div>
-                                        <p className="text-[10px] font-medium text-indigo-500/80 mt-1">
-                                            {(language === 'uz' ? personalOffer.reason_uz : personalOffer.reason_ru) || (language === 'uz' ? 'Siz uchun shaxsiy chegirma' : 'Персональная скидка')}
-                                            {personalOffer.expires_at
-                                                ? ` · ${new Date(personalOffer.expires_at).toLocaleDateString(language === 'uz' ? 'uz' : 'ru')} ${language === 'uz' ? 'gacha' : 'до'}`
-                                                : ''}
-                                        </p>
-                                    </>
-                                ) : (
-                                    <div className="flex items-baseline gap-4">
-                                        <div className="text-3xl lg:text-4xl font-bold tracking-tight text-[#111612]">
-                                            {Number(product.price || 0).toLocaleString()} <span className="text-xl font-normal text-gray-500">{language === 'uz' ? "so'm" : "сум"}</span>
-                                        </div>
-                                        {product.oldPrice && product.oldPrice > product.price && (
-                                            <span className="text-gray-300 line-through font-medium text-xl">{Number(product.oldPrice || 0).toLocaleString()}</span>
-                                        )}
-                                    </div>
-                                )}
+                            {/* Bepul narx yozuvi */}
+                            <div className="mb-6">
+                                <span className="text-green-600 font-bold text-2xl lg:text-3xl">
+                                    {language === 'uz' ? 'Bepul' : 'Бесплатно'}
+                                </span>
                             </div>
-
-                            {/* Stock Indicator (Desktop) */}
-                            {totalStock > 0 && (
-                                <div className="flex items-center gap-3 bg-green-50 p-4 rounded-3xl border border-green-100 mb-8 animate-in fade-in duration-500">
-                                    <div className="p-2 bg-green-100 text-green-600 rounded-2xl"><Check size={18} strokeWidth={3} /></div>
-                                    <p className="text-xs font-black text-gray-700 uppercase tracking-tighter">
-                                        {language === 'uz' ? 'Qoldiq' : 'В наличии'}: <span className="text-black">{Number(totalStock)} {language === 'uz' ? 'ta mavjud' : 'шт'}</span>
-                                    </p>
-                                </div>
-                            )}
 
                             {/* Short Specs Summary */}
                             <div className="grid grid-cols-2 gap-4 mb-10">
@@ -1049,15 +1079,7 @@ export default function ProductClient({
                             {/* Action Buttons */}
                             <div className="grid grid-cols-1 gap-3 mt-8">
                                 <button 
-                                    onClick={() => {
-                                        videoPreWarmer.triggerHaptic("medium");
-                                        const readUrl = product.archive_url || (product as any).pdf_url || (product as any).link;
-                                        if (readUrl) {
-                                            window.open(readUrl, "_blank");
-                                        } else {
-                                            showToast(language === 'uz' ? "Mutolaa havolasi tayyorlanmoqda..." : "Ссылка формируется...");
-                                        }
-                                    }}
+                                    onClick={handleOpenReader}
                                     className="glass-prominent-button w-full h-[52px] text-sm font-semibold rounded-[var(--radius-control)] flex items-center justify-center gap-2"
                                 >
                                     <BookOpen size={19} strokeWidth={2.4} />
@@ -1066,41 +1088,12 @@ export default function ProductClient({
                             </div>
                         </div>
 
-                        {/* 2. Delivery Panel (Right Side as Yandex) */}
-                        <div className="bg-[#F2F3F5] p-10 rounded-[40px] border border-gray-100 flex flex-col gap-8">
-                            {/* Do'kon kartasi (desktop) */}
-                            {store && <StoreCard store={store} language={language} />}
-                            <div className="flex items-start gap-4">
-                                <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center shadow-sm">
-                                    <Truck size={24} className="text-black" />
-                                </div>
-                                <div>
-                                    <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1">{language === 'uz' ? 'Yetkazib berish' : 'Доставка'}</p>
-                                    <p className="text-base font-black italic">{deliverySettings ? getDeliveryDateText(language, deliverySettings, selectedRegion) : (language === "uz" ? "Yetkazib berish..." : "Доставка...")}</p>
-                                    <p className="text-[11px] text-gray-500 font-medium">{language === 'uz' ? "Toshkent bo'ylab tekin" : 'Бесплатно по Ташкенту'}</p>
-                                </div>
+                        {/* Do'kon kartasi (agar mavjud bo'lsa) */}
+                        {store && (
+                            <div className="bg-[#F2F3F5] p-6 rounded-[32px] border border-gray-100">
+                                <StoreCard store={store} language={language} />
                             </div>
-                            <div className="flex items-start gap-4">
-                                <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center shadow-sm">
-                                    <RefreshCw size={24} className="text-blue-500" />
-                                </div>
-                                <div>
-                                    <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1">{language === 'uz' ? 'Qaytarib berish' : 'Возврат товара'}</p>
-                                    <p className="text-base font-black italic">{language === 'uz' ? '14 kun ichida oson va tez' : 'Просто и быстро за 14 дней'}</p>
-                                    <p className="text-[11px] text-gray-500 font-medium">{language === 'uz' ? 'Shartlar asosida qaytarish' : 'Возврат по условиям'}</p>
-                                </div>
-                            </div>
-                            <div className="flex items-start gap-4">
-                                <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center shadow-sm">
-                                    <ShieldCheck size={24} className="text-green-500" />
-                                </div>
-                                <div>
-                                    <p className="text-[10px] font-black text-green-600/50 uppercase tracking-widest mb-1">{language === 'uz' ? 'Kafolat' : 'Гарантия'}</p>
-                                    <p className="text-base font-black italic">{language === 'uz' ? '1 yil rasmiy kafolat' : '1 год официальной гарантии'}</p>
-                                    <p className="text-[11px] text-gray-500 font-medium">{language === 'uz' ? 'Original mahsulot 100%' : '100% Оригинальный товар'}</p>
-                                </div>
-                            </div>
-                        </div>
+                        )}
 
                         {/* 3. Description Truncated Preview Box (Fills space directly under Delivery Panel) */}
                         <div className="bg-[#F2F3F5] p-8 md:p-10 rounded-[40px] border border-gray-100 relative flex flex-col justify-between">
@@ -1211,15 +1204,7 @@ export default function ProductClient({
             >
                 <div style={{ display: "flex", gap: 8, alignItems: "stretch" }}>
                     <button
-                        onClick={() => {
-                            videoPreWarmer.triggerHaptic("medium");
-                            const readUrl = product.archive_url || (product as any).pdf_url || (product as any).link;
-                            if (readUrl) {
-                                window.open(readUrl, "_blank");
-                            } else {
-                                showToast(language === 'uz' ? "Mutolaa havolasi ochilmoqda..." : "Открытие чтения...");
-                            }
-                        }}
+                        onClick={handleOpenReader}
                         className="glass-prominent-button flex-1 text-sm font-semibold flex items-center justify-center gap-2"
                         style={{ height: 48, borderRadius: 16 }}
                     >
@@ -1309,6 +1294,95 @@ export default function ProductClient({
                             ))}
                         </div>
                     )}
+                </div>
+            )}
+
+            {/* In-browser Interactive BookReader Modal */}
+            {isReaderOpen && embedUrl && (
+                <div 
+                    ref={readerContainerRef}
+                    className="fixed inset-0 z-[250] flex flex-col bg-[#111612] text-white animate-in fade-in duration-200 select-none"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-label={language === 'uz' ? "Kitob mutolaasi" : "Чтение книги"}
+                >
+                    {/* Top Bar */}
+                    <div className="h-14 bg-[#182019] border-b border-white/10 px-4 md:px-6 flex items-center justify-between gap-4 shrink-0 shadow-md">
+                        {/* Left: Book info */}
+                        <div className="flex items-center gap-3 min-w-0">
+                            <div className="w-8 h-8 rounded-lg bg-green-600/20 text-green-400 flex items-center justify-center shrink-0 border border-green-500/20">
+                                <BookOpen size={17} strokeWidth={2.4} />
+                            </div>
+                            <div className="min-w-0">
+                                <h2 className="text-sm md:text-base font-semibold text-white truncate max-w-xs sm:max-w-md md:max-w-xl">
+                                    {product[language === 'uz' ? 'name_uz' : 'name_ru'] || product.name}
+                                </h2>
+                                <p className="text-[11px] text-gray-400 hidden sm:block truncate">
+                                    {language === 'uz' ? "Ochiq elektron kutubxona" : "Открытая электронная библиотека"}
+                                </p>
+                            </div>
+                        </div>
+
+                        {/* Right: Actions */}
+                        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                            {/* Yangi oynada ochish */}
+                            {directReadUrl && (
+                                <button
+                                    onClick={() => window.open(directReadUrl, "_blank")}
+                                    className="p-2 sm:px-3 sm:py-1.5 rounded-xl bg-white/5 hover:bg-white/10 active:scale-95 text-gray-300 hover:text-white text-xs font-medium flex items-center gap-1.5 transition-colors"
+                                    title={language === 'uz' ? "Yangi oynada ochish" : "Открыть в новой вкладке"}
+                                    aria-label={language === 'uz' ? "Yangi oynada ochish" : "Открыть в новой вкладке"}
+                                >
+                                    <ExternalLink size={16} />
+                                    <span className="hidden md:inline">{language === 'uz' ? "Yangi oynada" : "В новой вкладке"}</span>
+                                </button>
+                            )}
+
+                            {/* To'liq ekran */}
+                            <button
+                                onClick={toggleReaderFullscreen}
+                                className="p-2 sm:px-3 sm:py-1.5 rounded-xl bg-white/5 hover:bg-white/10 active:scale-95 text-gray-300 hover:text-white text-xs font-medium flex items-center gap-1.5 transition-colors"
+                                title={isReaderFullscreen 
+                                    ? (language === 'uz' ? "To'liq ekrandan chiqish" : "Выйти из полноэкранного режима") 
+                                    : (language === 'uz' ? "To'liq ekran" : "Во весь экран")}
+                                aria-label="Fullscreen"
+                            >
+                                {isReaderFullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+                                <span className="hidden md:inline">
+                                    {isReaderFullscreen 
+                                        ? (language === 'uz' ? "Kichraytirish" : "Свернуть") 
+                                        : (language === 'uz' ? "To'liq ekran" : "Во весь экран")}
+                                </span>
+                            </button>
+
+                            {/* Yopish (X) */}
+                            <button
+                                onClick={() => {
+                                    if (document.fullscreenElement) {
+                                        document.exitFullscreen().catch(() => {});
+                                    }
+                                    setIsReaderOpen(false);
+                                    setIsReaderFullscreen(false);
+                                }}
+                                className="p-2 sm:p-2 rounded-xl bg-white/10 hover:bg-red-500/80 active:scale-95 text-white text-xs font-medium flex items-center justify-center transition-colors ml-1"
+                                title={language === 'uz' ? "Yopish (Esc)" : "Закрыть (Esc)"}
+                                aria-label="Close"
+                            >
+                                <X size={18} strokeWidth={2.4} />
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Reader Body / Iframe */}
+                    <div className="flex-1 w-full h-full bg-[#1e1e1e] relative overflow-hidden">
+                        <iframe
+                            src={embedUrl}
+                            className="w-full h-full border-0 absolute inset-0"
+                            allowFullScreen
+                            allow="fullscreen"
+                            title={product[language === 'uz' ? 'name_uz' : 'name_ru'] || product.name}
+                        />
+                    </div>
                 </div>
             )}
         </div>
