@@ -48,7 +48,7 @@ async function getInitialData() {
             { data: storiesData },
             { data: warehousesData }
         ] = await Promise.all([
-            supabaseAdmin.from("products").select("id,name,name_uz,name_ru,price,old_price,image,images,image_metadata,sales,avg_rating,review_count,stock,stock_details,category_id,brand_id,video_url,model,color_name,group_id,is_original,article,express_delivery,created_at").eq("is_deleted", false).gt("stock", 0).order("sales", { ascending: false, nullsFirst: false }).order("avg_rating", { ascending: false, nullsFirst: false }).limit(30),
+            supabaseAdmin.from("products").select("id,name,name_uz,name_ru,author,archive_url,file_format,file_size_mb,price,old_price,image,images,image_metadata,sales,avg_rating,review_count,stock,stock_details,category_id,brand_id,video_url,model,color_name,group_id,is_original,article,express_delivery,created_at").eq("is_deleted", false).gt("stock", 0).order("sales", { ascending: false, nullsFirst: false }).order("avg_rating", { ascending: false, nullsFirst: false }).limit(30),
             supabaseAdmin.from("categories").select("id,name,name_uz,name_ru,parent_id,image,image_meta,icon,color,is_deleted").eq("is_deleted", false).order("name", { ascending: true }),
             supabaseAdmin.from("banners").select("id,title_uz,title_ru,html_uz,html_ru,active,order_index,tab_name_uz,tab_name_ru").eq("active", true).order("order_index", { ascending: true }),
             supabaseAdmin.from("settings").select("data").eq("id", "banners").single(),

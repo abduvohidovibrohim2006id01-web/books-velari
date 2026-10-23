@@ -37,6 +37,11 @@ export interface Product {
     videoUrl?: string;
     model?: string;
     brand_id?: string;
+    author?: string;
+    archive_url?: string;
+    archive_identifier?: string;
+    file_format?: string;
+    file_size_mb?: number;
     image_metadata?: Record<string, { alt_uz?: string; alt_ru?: string; blurDataURL?: string; lowResUrl?: string; xs?: string; md?: string; lg?: string }>;
     created_at?: string;
     ai_persona?: {
