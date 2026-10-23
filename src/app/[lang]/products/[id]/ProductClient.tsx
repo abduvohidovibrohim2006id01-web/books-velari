@@ -6,7 +6,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { supabase } from "@/lib/supabase";
 import { mapProduct, mapComment } from "@/lib/mappers";
 import { translations } from "@/lib/translations";
-import { Loader2, Plus, Minus, ShoppingBag, Heart, Star, Check, Truck, Clock, ShieldCheck, RefreshCw, Store as StoreIcon, ChevronRight, ChevronLeft, X, BookOpen } from "lucide-react";
+import { Loader2, Plus, Minus, ShoppingBag, Heart, Star, Check, Truck, Clock, ShieldCheck, RefreshCw, Store as StoreIcon, ChevronRight, ChevronLeft, Maximize2, X, BookOpen } from "lucide-react";
 import Link from "next/link";
 import { getDeliveryDateText } from "@/lib/date-utils";
 import Image from "next/image";
