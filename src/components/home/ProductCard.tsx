@@ -347,7 +347,7 @@ export const ProductCard = memo(({
       {/* Read action button */}
       <div style={{ marginTop: "auto", width: "100%" }}>
         <Link
-          href={`/${language}/products/${getProductSlug(item, language)}`}
+          href={`/${language}/products/${getProductSlug(item, language)}?read=1`}
           onClick={() => videoPreWarmer.triggerHaptic("medium")}
           className="active:scale-[0.98] transition-transform duration-120 select-none"
           style={{

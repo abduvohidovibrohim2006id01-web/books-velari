@@ -6,7 +6,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { supabase } from "@/lib/supabase";
 import { mapProduct, mapComment } from "@/lib/mappers";
 import { translations } from "@/lib/translations";
-import { Loader2, Plus, Minus, ShoppingBag, Heart, Star, Check, Truck, Clock, ShieldCheck, RefreshCw, Store as StoreIcon, ChevronRight, ChevronLeft, Maximize2, Minimize2, X, BookOpen, Download, ExternalLink } from "lucide-react";
+import { Loader2, Plus, Minus, ShoppingBag, Heart, Star, Check, Truck, Clock, ShieldCheck, RefreshCw, Store as StoreIcon, ChevronRight, ChevronLeft, Maximize2, Minimize2, X, BookOpen } from "lucide-react";
 import Link from "next/link";
 import { getDeliveryDateText } from "@/lib/date-utils";
 import Image from "next/image";
@@ -140,31 +140,43 @@ export default function ProductClient({
     const [popularLoading, setPopularLoading] = useState(false);
     const [isReaderOpen, setIsReaderOpen] = useState(false);
     const [isReaderFullscreen, setIsReaderFullscreen] = useState(false);
+    const [isReaderLoading, setIsReaderLoading] = useState(true);
     const readerContainerRef = useRef<HTMLDivElement>(null);
 
-    const archiveId = useMemo(() => {
-        if (!product) return null;
-        if (product.archive_identifier) return product.archive_identifier;
-        if (product.archive_url) {
-            const match = product.archive_url.match(/archive\.org\/(?:details|embed)\/([^/?#]+)/i);
-            if (match) return match[1];
-        }
-        return null;
+    const hasReadableBook = useMemo(() => {
+        if (!product) return false;
+        return Boolean(product.archive_identifier || product.archive_url || (product as any)?.pdf_url);
     }, [product]);
-
-    const embedUrl = archiveId ? `https://archive.org/embed/${archiveId}` : null;
-    const directReadUrl = product?.archive_url || (archiveId ? `https://archive.org/details/${archiveId}` : (product as any)?.pdf_url || (product as any)?.link);
 
     const handleOpenReader = useCallback(() => {
         videoPreWarmer.triggerHaptic("medium");
-        if (embedUrl) {
+        if (product && hasReadableBook) {
+            setIsReaderLoading(true);
             setIsReaderOpen(true);
-        } else if (directReadUrl) {
-            window.open(directReadUrl, "_blank");
         } else {
             showToast(language === 'uz' ? "Mutolaa havolasi tayyorlanmoqda..." : "Ссылка формируется...");
         }
-    }, [embedUrl, directReadUrl, language, showToast]);
+    }, [product, hasReadableBook, language, showToast]);
+
+    // Agar URL da ?read=1 yoki #read bo'lsa avtomatik mutolaa modalini ochish
+    useEffect(() => {
+        if (typeof window !== "undefined" && product && hasReadableBook) {
+            const searchParams = new URLSearchParams(window.location.search);
+            if (searchParams.get("read") === "1" || window.location.hash === "#read") {
+                setIsReaderLoading(true);
+                setIsReaderOpen(true);
+            }
+        }
+    }, [product, hasReadableBook]);
+
+    // Mutolaa ochilganda yuklanish taymerini o'rnatish
+    useEffect(() => {
+        if (isReaderOpen) {
+            setIsReaderLoading(true);
+            const timer = setTimeout(() => setIsReaderLoading(false), 5000);
+            return () => clearTimeout(timer);
+        }
+    }, [isReaderOpen]);
 
     const toggleReaderFullscreen = useCallback(() => {
         if (!document.fullscreenElement) {
@@ -1298,46 +1310,35 @@ export default function ProductClient({
             )}
 
             {/* In-browser Interactive BookReader Modal */}
-            {isReaderOpen && embedUrl && (
+            {isReaderOpen && product && (
                 <div 
                     ref={readerContainerRef}
                     className="fixed inset-0 z-[250] flex flex-col bg-[#111612] text-white animate-in fade-in duration-200 select-none"
                     role="dialog"
                     aria-modal="true"
                     aria-label={language === 'uz' ? "Kitob mutolaasi" : "Чтение книги"}
+                    onContextMenu={(e) => e.preventDefault()}
                 >
                     {/* Top Bar */}
                     <div className="h-14 bg-[#182019] border-b border-white/10 px-4 md:px-6 flex items-center justify-between gap-4 shrink-0 shadow-md">
-                        {/* Left: Book info */}
+                        {/* Left: Book info & Green Online badge */}
                         <div className="flex items-center gap-3 min-w-0">
-                            <div className="w-8 h-8 rounded-lg bg-green-600/20 text-green-400 flex items-center justify-center shrink-0 border border-green-500/20">
+                            <div className="w-8 h-8 rounded-lg bg-emerald-600/20 text-emerald-400 flex items-center justify-center shrink-0 border border-emerald-500/20">
                                 <BookOpen size={17} strokeWidth={2.4} />
                             </div>
                             <div className="min-w-0">
                                 <h2 className="text-sm md:text-base font-semibold text-white truncate max-w-xs sm:max-w-md md:max-w-xl">
                                     {product[language === 'uz' ? 'name_uz' : 'name_ru'] || product.name}
                                 </h2>
-                                <p className="text-[11px] text-gray-400 hidden sm:block truncate">
-                                    {language === 'uz' ? "Ochiq elektron kutubxona" : "Открытая электронная библиотека"}
+                                <p className="text-[11px] text-emerald-400 font-medium flex items-center gap-1.5 truncate">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                                    {language === 'uz' ? "Onlayn mutolaa" : "Онлайн чтение"}
                                 </p>
                             </div>
                         </div>
 
                         {/* Right: Actions */}
                         <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-                            {/* Yangi oynada ochish */}
-                            {directReadUrl && (
-                                <button
-                                    onClick={() => window.open(directReadUrl, "_blank")}
-                                    className="p-2 sm:px-3 sm:py-1.5 rounded-xl bg-white/5 hover:bg-white/10 active:scale-95 text-gray-300 hover:text-white text-xs font-medium flex items-center gap-1.5 transition-colors"
-                                    title={language === 'uz' ? "Yangi oynada ochish" : "Открыть в новой вкладке"}
-                                    aria-label={language === 'uz' ? "Yangi oynada ochish" : "Открыть в новой вкладке"}
-                                >
-                                    <ExternalLink size={16} />
-                                    <span className="hidden md:inline">{language === 'uz' ? "Yangi oynada" : "В новой вкладке"}</span>
-                                </button>
-                            )}
-
                             {/* To'liq ekran */}
                             <button
                                 onClick={toggleReaderFullscreen}
@@ -1375,12 +1376,21 @@ export default function ProductClient({
 
                     {/* Reader Body / Iframe */}
                     <div className="flex-1 w-full h-full bg-[#1e1e1e] relative overflow-hidden">
+                        {isReaderLoading && (
+                            <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[#111612] text-white gap-3 select-none">
+                                <Loader2 className="w-9 h-9 text-emerald-400 animate-spin" />
+                                <p className="text-sm font-medium text-gray-300">
+                                    {language === 'uz' ? "Kitob ochilmoqda..." : "Загрузка книги..."}
+                                </p>
+                            </div>
+                        )}
                         <iframe
-                            src={embedUrl}
-                            className="w-full h-full border-0 absolute inset-0"
+                            src={`/api/read/${product.id}#toolbar=0&navpanes=0&scrollbar=1&view=FitH`}
+                            className="w-full h-full border-0 absolute inset-0 bg-[#2b2b2b]"
                             allowFullScreen
                             allow="fullscreen"
                             title={product[language === 'uz' ? 'name_uz' : 'name_ru'] || product.name}
+                            onLoad={() => setIsReaderLoading(false)}
                         />
                     </div>
                 </div>
