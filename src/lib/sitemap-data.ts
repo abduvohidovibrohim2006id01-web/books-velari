@@ -133,7 +133,7 @@ async function getNonEmptyCategoryIds(categories: { id: string; parent_id?: stri
  */
 export async function fetchIndexableProducts(columns: string): Promise<any[]> {
     const products = await fetchAllRows('products', columns, (q) =>
-        q.eq('is_deleted', false).gt('price', 0).not('image', 'is', null).neq('image', ''),
+        q.eq('is_deleted', false).gt('stock', 0),
     );
     return products.filter(isIndexableProduct);
 }
