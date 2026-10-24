@@ -21,6 +21,7 @@ export async function GET(
         const cleanId = getProductIdFromSlug(rawId);
 
         let archiveIdentifier: string | null = null;
+        let fileName: string | null = null;
 
         // 1. Supabase'dan mahsulotni topish
         try {
@@ -32,12 +33,28 @@ export async function GET(
                 .maybeSingle();
 
             if (product) {
-                if (product.archive_identifier) {
-                    archiveIdentifier = product.archive_identifier;
-                } else if (product.archive_url) {
-                    const match = product.archive_url.match(/archive\.org\/(?:details|embed|download)\/([^/?#]+)/i);
-                    if (match) {
-                        archiveIdentifier = match[1];
+                // To'plam / Volume to'g'ridan-to'g'ri fayl manzili mavjudligini tekshirish
+                if (product.archive_url) {
+                    const directFileMatch = product.archive_url.match(/archive\.org\/download\/([^/?#]+)\/([^/?#]+\.pdf)/i);
+                    if (directFileMatch) {
+                        archiveIdentifier = directFileMatch[1];
+                        try {
+                            fileName = decodeURIComponent(directFileMatch[2]);
+                        } catch {
+                            fileName = directFileMatch[2];
+                        }
+                    }
+                }
+
+                // Agar to'g'ridan-to'g'ri fayl manzili topilmagan bo'lsa, standart identifikatordan aniqlash
+                if (!archiveIdentifier) {
+                    if (product.archive_identifier) {
+                        archiveIdentifier = product.archive_identifier;
+                    } else if (product.archive_url) {
+                        const match = product.archive_url.match(/archive\.org\/(?:details|embed|download)\/([^/?#]+)/i);
+                        if (match) {
+                            archiveIdentifier = match[1];
+                        }
                     }
                 }
             }
@@ -58,49 +75,50 @@ export async function GET(
             return new Response("Kitob arxiv identifikatori topilmadi", { status: 404 });
         }
 
-        // 2. Archive.org fayl nomini aniqlash (keda bo'lsa darhol olamiz)
-        let fileName: string | null = null;
-        const now = Date.now();
-        const cached = FILE_CACHE.get(archiveIdentifier);
+        // 2. Archive.org fayl nomini aniqlash (agar to'plamdan to'g'ridan-to'g'ri olinmagan bo'lsa)
+        if (!fileName) {
+            const now = Date.now();
+            const cached = FILE_CACHE.get(archiveIdentifier);
 
-        if (cached && cached.expires > now) {
-            fileName = cached.fileName;
-        } else {
-            const metaRes = await fetch(`https://archive.org/metadata/${encodeURIComponent(archiveIdentifier)}`, {
-                headers: {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
-                    "Accept": "application/json",
-                },
-                next: { revalidate: 86400 } // 24 soat kesh
-            });
+            if (cached && cached.expires > now) {
+                fileName = cached.fileName;
+            } else {
+                const metaRes = await fetch(`https://archive.org/metadata/${encodeURIComponent(archiveIdentifier)}`, {
+                    headers: {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
+                        "Accept": "application/json",
+                    },
+                    next: { revalidate: 86400 } // 24 soat kesh
+                });
 
-            if (!metaRes.ok) {
-                return new Response("Arxiv ma'lumotlarini yuklab bo'lmadi", { status: 404 });
+                if (!metaRes.ok) {
+                    return new Response("Arxiv ma'lumotlarini yuklab bo'lmadi", { status: 404 });
+                }
+
+                const metaData = await metaRes.json();
+                const files: any[] = Array.isArray(metaData?.files) ? metaData.files : [];
+
+                const pdfFiles = files.filter((f: any) => {
+                    const name = (f.name || "").toLowerCase();
+                    const format = (f.format || "").toLowerCase();
+                    return (format.includes("pdf") || name.endsWith(".pdf")) && !name.endsWith(".xml") && !name.endsWith(".sqlite");
+                });
+
+                const selected = pdfFiles.find((f: any) => f.format === "Text PDF")
+                    || pdfFiles.find((f: any) => f.source === "original" && f.name?.toLowerCase().endsWith(".pdf"))
+                    || pdfFiles[0];
+
+                if (!selected || !selected.name) {
+                    return new Response("Kitobning PDF formati topilmadi", { status: 404 });
+                }
+
+                const resolvedName = String(selected.name);
+                fileName = resolvedName;
+                FILE_CACHE.set(archiveIdentifier, {
+                    fileName: resolvedName,
+                    expires: now + 24 * 60 * 60 * 1000 // 24 soat
+                });
             }
-
-            const metaData = await metaRes.json();
-            const files: any[] = Array.isArray(metaData?.files) ? metaData.files : [];
-
-            const pdfFiles = files.filter((f: any) => {
-                const name = (f.name || "").toLowerCase();
-                const format = (f.format || "").toLowerCase();
-                return (format.includes("pdf") || name.endsWith(".pdf")) && !name.endsWith(".xml") && !name.endsWith(".sqlite");
-            });
-
-            const selected = pdfFiles.find((f: any) => f.format === "Text PDF")
-                || pdfFiles.find((f: any) => f.source === "original" && f.name?.toLowerCase().endsWith(".pdf"))
-                || pdfFiles[0];
-
-            if (!selected || !selected.name) {
-                return new Response("Kitobning PDF formati topilmadi", { status: 404 });
-            }
-
-            const resolvedName = String(selected.name);
-            fileName = resolvedName;
-            FILE_CACHE.set(archiveIdentifier, {
-                fileName: resolvedName,
-                expires: now + 24 * 60 * 60 * 1000 // 24 soat
-            });
         }
 
         if (!fileName) {
