@@ -1,7 +1,7 @@
-import { supabaseAdmin } from "@/lib/supabase-admin";
+import { supabaseAdminFresh } from "@/lib/supabase-admin";
 import { getProductIdFromSlug } from "@/lib/slugify";
 
-// In-memory cache for resolved PDF filenames (24 hours TTL)
+// In-memory cache for resolved PDF filenames (1 hour TTL)
 const FILE_CACHE = new Map<string, { fileName: string; expires: number }>();
 
 export const dynamic = "force-dynamic";
@@ -23,9 +23,9 @@ export async function GET(
         let archiveIdentifier: string | null = null;
         let fileName: string | null = null;
 
-        // 1. Supabase'dan mahsulotni topish
+        // 1. Supabase'dan doimo FRESH ma'lumot olish (Next.js Data Cache bypass)
         try {
-            const { data: product } = await supabaseAdmin
+            const { data: product } = await supabaseAdminFresh
                 .from("products")
                 .select("id, name, archive_identifier, archive_url")
                 .or(`id.eq.${cleanId},article.eq.${cleanId},archive_identifier.eq.${cleanId},id.eq.${rawId},article.eq.${rawId},archive_identifier.eq.${rawId}`)
@@ -33,7 +33,7 @@ export async function GET(
                 .maybeSingle();
 
             if (product) {
-                // To'plam / Volume to'g'ridan-to'g'ri fayl manzili mavjudligini tekshirish
+                // To'plam / Direct fayl manzili mavjudligini tekshirish
                 if (product.archive_url) {
                     const directFileMatch = product.archive_url.match(/archive\.org\/download\/([^/?#]+)\/([^/?#]+\.pdf)/i);
                     if (directFileMatch) {
@@ -66,42 +66,49 @@ export async function GET(
             return new Response("Kitob arxivda topilmadi", { status: 404 });
         }
 
-        // 2. Archive.org fayl nomini aniqlash (agar to'plamdan to'g'ridan-to'g'ri olinmagan bo'lsa)
-        if (!fileName) {
-            const now = Date.now();
-            const cached = FILE_CACHE.get(archiveIdentifier);
-
-            if (cached && cached.expires > now) {
-                fileName = cached.fileName;
-            } else {
-                const metaRes = await fetch(`https://archive.org/metadata/${encodeURIComponent(archiveIdentifier)}`, {
+        // Helper: metadata orqali faylni aniqlash
+        async function resolveFileNameFromMeta(identifier: string): Promise<string | null> {
+            try {
+                const metaRes = await fetch(`https://archive.org/metadata/${encodeURIComponent(identifier)}`, {
                     headers: {
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
                         "Accept": "application/json",
                     },
-                    next: { revalidate: 86400 }
+                    cache: "no-store"
                 });
 
-                if (metaRes.ok) {
-                    const metaData = await metaRes.json();
-                    const files: any[] = Array.isArray(metaData?.files) ? metaData.files : [];
-                    const pdfFiles = files.filter((f: any) => {
-                        const name = (f.name || "").toLowerCase();
-                        const format = (f.format || "").toLowerCase();
-                        return (format.includes("pdf") || name.endsWith(".pdf")) && !name.endsWith(".xml") && !name.endsWith(".sqlite");
+                if (!metaRes.ok) return null;
+                const metaData = await metaRes.json();
+                const files: any[] = Array.isArray(metaData?.files) ? metaData.files : [];
+                const pdfFiles = files.filter((f: any) => {
+                    const name = (f.name || "").toLowerCase();
+                    const format = (f.format || "").toLowerCase();
+                    return (format.includes("pdf") || name.endsWith(".pdf")) && !name.endsWith(".xml") && !name.endsWith(".sqlite");
+                });
+
+                const selected = pdfFiles.find((f: any) => f.format === "Text PDF")
+                    || pdfFiles.find((f: any) => f.source === "original" && f.name?.toLowerCase().endsWith(".pdf"))
+                    || pdfFiles[0];
+
+                return selected?.name ? String(selected.name) : null;
+            } catch {
+                return null;
+            }
+        }
+
+        // 2. Agar fayl nomi hali aniqlanmagan bo'lsa
+        if (!fileName) {
+            const now = Date.now();
+            const cached = FILE_CACHE.get(archiveIdentifier);
+            if (cached && cached.expires > now) {
+                fileName = cached.fileName;
+            } else {
+                fileName = await resolveFileNameFromMeta(archiveIdentifier);
+                if (fileName) {
+                    FILE_CACHE.set(archiveIdentifier, {
+                        fileName: fileName,
+                        expires: now + 3600 * 1000
                     });
-
-                    const selected = pdfFiles.find((f: any) => f.format === "Text PDF")
-                        || pdfFiles.find((f: any) => f.source === "original" && f.name?.toLowerCase().endsWith(".pdf"))
-                        || pdfFiles[0];
-
-                    if (selected && selected.name) {
-                        fileName = String(selected.name);
-                        FILE_CACHE.set(archiveIdentifier, {
-                            fileName: fileName,
-                            expires: now + 24 * 60 * 60 * 1000
-                        });
-                    }
                 }
             }
         }
@@ -111,7 +118,7 @@ export async function GET(
         }
 
         // 3. Archive.org'dan PDF faylni oqim (stream) ko'rinishida olish
-        const downloadUrl = `https://archive.org/download/${archiveIdentifier}/${encodeURIComponent(fileName)}`;
+        let downloadUrl = `https://archive.org/download/${archiveIdentifier}/${encodeURIComponent(fileName)}`;
         const fetchHeaders: Record<string, string> = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/pdf,*/*",
@@ -122,10 +129,25 @@ export async function GET(
             fetchHeaders["Range"] = rangeHeader;
         }
 
-        const archiveRes = await fetch(downloadUrl, {
+        let archiveRes = await fetch(downloadUrl, {
             headers: fetchHeaders,
             redirect: "follow",
+            cache: "no-store"
         });
+
+        // Agar to'g'ridan-to'g'ri fayl 404 bersa, metadata orqali qayta tekshiramiz
+        if (!archiveRes.ok && archiveRes.status !== 206) {
+            const metaFileName = await resolveFileNameFromMeta(archiveIdentifier);
+            if (metaFileName && metaFileName !== fileName) {
+                fileName = metaFileName;
+                downloadUrl = `https://archive.org/download/${archiveIdentifier}/${encodeURIComponent(fileName)}`;
+                archiveRes = await fetch(downloadUrl, {
+                    headers: fetchHeaders,
+                    redirect: "follow",
+                    cache: "no-store"
+                });
+            }
+        }
 
         if (!archiveRes.ok && archiveRes.status !== 206) {
             return new Response("Kitob faylini yuklab bo'lmadi", { status: archiveRes.status });
