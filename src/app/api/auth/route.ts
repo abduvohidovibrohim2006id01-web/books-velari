@@ -41,15 +41,21 @@ export async function POST(req: NextRequest) {
         const { id, password, code, step = "password" } = validation.data;
 
         // 1. IRON BANK: Brute Force & Vault Lock Shield
-        const { data: userData } = await supabaseAdmin.from("users").select("is_vault_locked").eq("phone", id).single();
-        if (userData?.is_vault_locked) {
-            return NextResponse.json({ error: "VAULT LOCK: Admin panel favqulodda holat tufayli yopilgan." }, { status: 403 });
-        }
+        try {
+            const { data: userData } = await supabaseAdmin.from("users").select("is_vault_locked").eq("phone", id).single();
+            if (userData?.is_vault_locked) {
+                return NextResponse.json({ error: "VAULT LOCK: Admin panel favqulodda holat tufayli yopilgan." }, { status: 403 });
+            }
+        } catch {}
 
-        const { data: trap } = await supabaseAdmin.from("security_traps").select("*").eq("ip_address", ip).single();
-        if (trap?.is_blocked) {
-            return NextResponse.json({ error: "XAVFSIZLIK: IP-manzilingiz shubhali harakat tufayli bloklangan." }, { status: 403 });
-        }
+        let trap: any = null;
+        try {
+            const { data: trapData } = await supabaseAdmin.from("security_traps").select("*").eq("ip_address", ip).single();
+            trap = trapData;
+            if (trap?.is_blocked) {
+                return NextResponse.json({ error: "XAVFSIZLIK: IP-manzilingiz shubhali harakat tufayli bloklangan." }, { status: 403 });
+            }
+        } catch {}
 
         const ADMIN_ID = process.env.ADMIN_LOGIN?.trim();
         const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD?.trim();
@@ -90,17 +96,47 @@ export async function POST(req: NextRequest) {
                 return NextResponse.json({ error: "Xatolik! Qolgan urinishlar: " + (3 - currentAttempts) }, { status: 401 });
             }
 
+            // Agar Telegram 2FA bot sozlanmagan bo'lsa -> To'g'ridan-to'g'ri tizimga kiritish (Token va Cookie berish)
+            if (!BOT_TOKEN || !ADMIN_CHAT_ID) {
+                const now = Math.floor(Date.now() / 1000);
+                const token = createToken({
+                    sub: ADMIN_ID,
+                    role: "admin",
+                    iat: now,
+                    exp: now + 604800, // 7 kun
+                    vault_level: 5
+                }, ADMIN_SECRET);
+
+                const response = NextResponse.json({
+                    success: true,
+                    user: { id: "ADMIN", phone: "ADMIN", name: "Master Administrator", isAdmin: true },
+                    token
+                });
+
+                response.cookies.set("admin_token", token, {
+                    httpOnly: true,
+                    secure: process.env.NODE_ENV === "production",
+                    sameSite: "lax",
+                    maxAge: 604800, // 7 kun
+                    path: "/"
+                });
+
+                return response;
+            }
+
             // Correct Password -> Generate 2FA
             const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
             const expires = new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
             // Save OTP to DB (bypass RLS)
-            await supabaseAdmin.from("wallet_otps").delete().eq("phone", "ADMIN_VAULT");
-            await supabaseAdmin.from("wallet_otps").insert([{
-                phone: "ADMIN_VAULT",
-                code: otpCode,
-                expires_at: expires
-            }]);
+            try {
+                await supabaseAdmin.from("wallet_otps").delete().eq("phone", "ADMIN_VAULT");
+                await supabaseAdmin.from("wallet_otps").insert([{
+                    phone: "ADMIN_VAULT",
+                    code: otpCode,
+                    expires_at: expires
+                }]);
+            } catch {}
 
             // Notify via Telegram
             if (BOT_TOKEN && ADMIN_CHAT_ID) {
