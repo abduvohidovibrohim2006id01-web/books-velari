@@ -6,6 +6,36 @@ const FILE_CACHE = new Map<string, { fileName: string; expires: number }>();
 
 export const dynamic = "force-dynamic";
 
+// Helper: metadata orqali faylni aniqlash (Module-level to avoid TS1252 block-scoped function declaration)
+async function resolveFileNameFromMeta(identifier: string): Promise<string | null> {
+    try {
+        const metaRes = await fetch(`https://archive.org/metadata/${encodeURIComponent(identifier)}`, {
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
+                "Accept": "application/json",
+            },
+            cache: "no-store"
+        });
+
+        if (!metaRes.ok) return null;
+        const metaData = await metaRes.json();
+        const files: any[] = Array.isArray(metaData?.files) ? metaData.files : [];
+        const pdfFiles = files.filter((f: any) => {
+            const name = (f.name || "").toLowerCase();
+            const format = (f.format || "").toLowerCase();
+            return (format.includes("pdf") || name.endsWith(".pdf")) && !name.endsWith(".xml") && !name.endsWith(".sqlite");
+        });
+
+        const selected = pdfFiles.find((f: any) => f.format === "Text PDF")
+            || pdfFiles.find((f: any) => f.source === "original" && f.name?.toLowerCase().endsWith(".pdf"))
+            || pdfFiles[0];
+
+        return selected?.name ? String(selected.name) : null;
+    } catch {
+        return null;
+    }
+}
+
 export async function GET(
     request: Request,
     { params }: { params: { id: string } | Promise<{ id: string }> }
@@ -64,36 +94,6 @@ export async function GET(
 
         if (!archiveIdentifier) {
             return new Response("Kitob arxivda topilmadi", { status: 404 });
-        }
-
-        // Helper: metadata orqali faylni aniqlash
-        async function resolveFileNameFromMeta(identifier: string): Promise<string | null> {
-            try {
-                const metaRes = await fetch(`https://archive.org/metadata/${encodeURIComponent(identifier)}`, {
-                    headers: {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
-                        "Accept": "application/json",
-                    },
-                    cache: "no-store"
-                });
-
-                if (!metaRes.ok) return null;
-                const metaData = await metaRes.json();
-                const files: any[] = Array.isArray(metaData?.files) ? metaData.files : [];
-                const pdfFiles = files.filter((f: any) => {
-                    const name = (f.name || "").toLowerCase();
-                    const format = (f.format || "").toLowerCase();
-                    return (format.includes("pdf") || name.endsWith(".pdf")) && !name.endsWith(".xml") && !name.endsWith(".sqlite");
-                });
-
-                const selected = pdfFiles.find((f: any) => f.format === "Text PDF")
-                    || pdfFiles.find((f: any) => f.source === "original" && f.name?.toLowerCase().endsWith(".pdf"))
-                    || pdfFiles[0];
-
-                return selected?.name ? String(selected.name) : null;
-            } catch {
-                return null;
-            }
         }
 
         // 2. Agar fayl nomi hali aniqlanmagan bo'lsa
