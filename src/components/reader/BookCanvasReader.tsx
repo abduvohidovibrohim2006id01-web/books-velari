@@ -21,7 +21,8 @@ import {
     VolumeX,
     Sparkles,
     Sun,
-    Moon
+    Moon,
+    Palette
 } from "lucide-react";
 
 // ============================================================================
@@ -118,7 +119,7 @@ class PaperSoundManager {
             if (!ctx) return;
 
             const now = ctx.currentTime;
-            const duration = 0.22;
+            const duration = 0.24;
             const bufferSize = Math.floor(ctx.sampleRate * duration);
             const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
             const data = buffer.getChannelData(0);
@@ -139,22 +140,22 @@ class PaperSoundManager {
             const noiseSource = ctx.createBufferSource();
             noiseSource.buffer = buffer;
 
-            // Bandpass filter to match paper sliding frequencies (~1400Hz -> ~750Hz)
+            // Bandpass filter to match paper sliding frequencies (~1450Hz -> ~750Hz)
             const bandpass = ctx.createBiquadFilter();
             bandpass.type = "bandpass";
-            bandpass.frequency.setValueAtTime(1500, now);
+            bandpass.frequency.setValueAtTime(1450, now);
             bandpass.frequency.exponentialRampToValueAtTime(750, now + duration);
-            bandpass.Q.setValueAtTime(2.0, now);
+            bandpass.Q.setValueAtTime(2.2, now);
 
             // Lowpass filter to smooth out static crackles
             const lowpass = ctx.createBiquadFilter();
             lowpass.type = "lowpass";
-            lowpass.frequency.setValueAtTime(2800, now);
+            lowpass.frequency.setValueAtTime(2600, now);
 
-            // Volume gain envelope (Soft attack + natural fade)
+            // Volume gain envelope
             const gain = ctx.createGain();
             gain.gain.setValueAtTime(0.001, now);
-            gain.gain.linearRampToValueAtTime(0.16, now + 0.03);
+            gain.gain.linearRampToValueAtTime(0.18, now + 0.03);
             gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
 
             noiseSource.connect(bandpass);
@@ -249,6 +250,15 @@ export interface BookCanvasReaderProps {
 export type PaperTheme = "sepia" | "white" | "night";
 export type ViewMode = "double" | "single";
 
+interface FlipState {
+    direction: "next" | "prev";
+    frontSnapshot: string | null;
+    backSnapshot: string | null;
+    underlyingSnapshot: string | null;
+    underlyingPageNum: number | null;
+    backPageNum: number | null;
+}
+
 export function BookCanvasReader({
     productId,
     bookTitle,
@@ -266,11 +276,13 @@ export function BookCanvasReader({
     const singleCanvasRef = useRef<HTMLCanvasElement>(null);
 
     // PDF / Network refs
-    const xhrRef = useRef<XMLHttpRequest | null>(null);
     const pdfDocRef = useRef<any>(null);
     const leftRenderTaskRef = useRef<any>(null);
     const rightRenderTaskRef = useRef<any>(null);
     const singleRenderTaskRef = useRef<any>(null);
+
+    // Page snapshots cache (for instantaneous 0ms 3D flip textures)
+    const pageSnapshotsRef = useRef<Map<number, string>>(new Map());
 
     // Loading & Network States
     const [status, setStatus] = useState<"checking" | "downloading" | "rendering" | "ready" | "error">("checking");
@@ -297,10 +309,11 @@ export function BookCanvasReader({
     const [viewMode, setViewMode] = useState<ViewMode>("double");
     const [paperTheme, setPaperTheme] = useState<PaperTheme>("sepia");
     const [isSoundEnabled, setIsSoundEnabled] = useState<boolean>(true);
+    const [showThemeMenu, setShowThemeMenu] = useState<boolean>(false);
 
     // 3D Flip Animation State
     const [isFlipping, setIsFlipping] = useState<boolean>(false);
-    const [flipDirection, setFlipDirection] = useState<"next" | "prev" | null>(null);
+    const [flipState, setFlipState] = useState<FlipState | null>(null);
 
     // Rendered Page Dimensions (for matching Inside Cover placeholders)
     const [renderedDims, setRenderedDims] = useState<{ width: number; height: number }>({ width: 440, height: 620 });
@@ -346,7 +359,25 @@ export function BookCanvasReader({
     }, []);
 
     // ------------------------------------------------------------------------
-    // 1. Initial Load: Check IndexedDB -> Download if not cached
+    // Restore last read page helper
+    // ------------------------------------------------------------------------
+    const initReaderPage = (docNumPages: number) => {
+        let initialPage = 1;
+        try {
+            const saved = localStorage.getItem(`book_page_${productId}`);
+            if (saved) {
+                const parsed = parseInt(saved, 10);
+                if (parsed >= 1 && parsed <= docNumPages) {
+                    initialPage = parsed;
+                }
+            }
+        } catch (_) {}
+        setCurrentPage(initialPage);
+        setPageInputValue(String(initialPage));
+    };
+
+    // ------------------------------------------------------------------------
+    // 1. Initial Load: Progressive HTTP Range Streaming with Background Cache
     // ------------------------------------------------------------------------
     const startLoadingBook = useCallback(async () => {
         setStatus("checking");
@@ -356,135 +387,91 @@ export function BookCanvasReader({
         setTotalBytes(0);
 
         try {
-            // Check IndexedDB
+            const pdfjs = await loadPdfJs();
+
+            // 1. Check IndexedDB first for instant 0ms offline opening
             const cachedBuffer = await getCachedBook(productId);
             if (cachedBuffer && cachedBuffer.byteLength > 1000) {
                 setIsFromCache(true);
-                initPdfDocument(cachedBuffer);
+                setStatus("rendering");
+                const loadingTask = pdfjs.getDocument({
+                    data: cachedBuffer,
+                    cMapUrl: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/cmaps/",
+                    cMapPacked: true,
+                });
+                const doc = await loadingTask.promise;
+                pdfDocRef.current = doc;
+                setTotalPages(doc.numPages);
+                initReaderPage(doc.numPages);
+                setStatus("ready");
                 return;
             }
 
-            // Not in cache -> Download with real XHR progress
-            setStatus("downloading");
+            // 2. Not in cache -> Progressive Range Request Streaming!
+            // Opens in 0.5 - 1.0s without downloading whole 20MB file upfront
             setIsFromCache(false);
+            setStatus("downloading");
 
-            const xhr = new XMLHttpRequest();
-            xhrRef.current = xhr;
-            xhr.open("GET", `/api/read/${encodeURIComponent(productId)}`, true);
-            xhr.responseType = "arraybuffer";
+            const streamUrl = `/api/read/${encodeURIComponent(productId)}`;
 
-            xhr.onprogress = (e) => {
-                if (e.lengthComputable && e.total > 0) {
-                    const pct = Math.min(100, Math.round((e.loaded / e.total) * 100));
-                    setDownloadPercent(pct);
-                    setLoadedBytes(e.loaded);
-                    setTotalBytes(e.total);
-                } else {
-                    setLoadedBytes(e.loaded);
-                    setTotalBytes(0);
-                    setDownloadPercent((prev) => (prev < 90 ? prev + 5 : 90));
-                }
-            };
-
-            xhr.onload = async () => {
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    const buffer = xhr.response as ArrayBuffer;
-                    if (!buffer || buffer.byteLength < 100) {
-                        setStatus("error");
-                        setErrorMessage(
-                            language === "uz"
-                                ? "Kitob fayli bo'sh yoki noto'g'ri yuklandi."
-                                : "Файл книги пуст или поврежден."
-                        );
-                        return;
-                    }
-
-                    setDownloadPercent(100);
-                    // Save to IndexedDB in background
-                    saveBookToCache(productId, buffer).catch(() => {});
-
-                    // Initialize PDF.js
-                    initPdfDocument(buffer);
-                } else {
-                    setStatus("error");
-                    setErrorMessage(
-                        language === "uz"
-                            ? `Kitobni yuklab bo'lmadi (Server status: ${xhr.status})`
-                            : `Не удалось загрузить книгу (Статус сервера: ${xhr.status})`
-                    );
-                }
-            };
-
-            xhr.onerror = () => {
-                setStatus("error");
-                setErrorMessage(
-                    language === "uz"
-                        ? "Tarmoq xatosi. Internet aloqasini tekshirib qayta urining."
-                        : "Ошибка сети. Проверьте интернет-соединение и повторите попытку."
-                );
-            };
-
-            xhr.onabort = () => {};
-
-            xhr.send();
-        } catch (err: any) {
-            console.error("[BookCanvasReader] Load error:", err);
-            setStatus("error");
-            setErrorMessage(err?.message || "Xatolik yuz berdi");
-        }
-    }, [productId, language]);
-
-    // ------------------------------------------------------------------------
-    // 2. Initialize PDF.js Document
-    // ------------------------------------------------------------------------
-    const initPdfDocument = async (arrayBuffer: ArrayBuffer) => {
-        setStatus("rendering");
-        try {
-            const pdfjs = await loadPdfJs();
             const loadingTask = pdfjs.getDocument({
-                data: arrayBuffer,
+                url: streamUrl,
+                disableAutoFetch: true,
+                disableStream: false,
+                rangeChunkSize: 65536, // 64KB range chunks
                 cMapUrl: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/cmaps/",
                 cMapPacked: true,
             });
 
+            loadingTask.onProgress = ({ loaded, total }: { loaded: number; total: number }) => {
+                if (total > 0) {
+                    setLoadedBytes(loaded);
+                    setTotalBytes(total);
+                    setDownloadPercent(Math.min(100, Math.round((loaded / total) * 100)));
+                } else {
+                    setLoadedBytes(loaded);
+                    setDownloadPercent((prev) => (prev < 90 ? prev + 10 : 90));
+                }
+            };
+
             const doc = await loadingTask.promise;
             pdfDocRef.current = doc;
             setTotalPages(doc.numPages);
-
-            // Restore last read page if available
-            let initialPage = 1;
-            try {
-                const saved = localStorage.getItem(`book_page_${productId}`);
-                if (saved) {
-                    const parsed = parseInt(saved, 10);
-                    if (parsed >= 1 && parsed <= doc.numPages) {
-                        initialPage = parsed;
-                    }
-                }
-            } catch (_) {}
-
-            setCurrentPage(initialPage);
-            setPageInputValue(String(initialPage));
+            initReaderPage(doc.numPages);
             setStatus("ready");
+
+            // 3. Background Caching: Fetch full PDF in idle background & persist to IndexedDB
+            fetch(streamUrl)
+                .then((res) => {
+                    if (res.ok) return res.arrayBuffer();
+                    return null;
+                })
+                .then((buffer) => {
+                    if (buffer && buffer.byteLength > 1000) {
+                        saveBookToCache(productId, buffer).catch(() => {});
+                        setIsFromCache(true);
+                    }
+                })
+                .catch((bgErr) => {
+                    console.warn("[BookCanvasReader] Background caching info:", bgErr);
+                });
+
         } catch (err: any) {
-            console.error("[BookCanvasReader] PDF init error:", err);
+            console.error("[BookCanvasReader] Load/Stream error:", err);
             setStatus("error");
             setErrorMessage(
                 language === "uz"
-                    ? "Kitob sahifalarini o'qib bo'lmadi. Fayl shikastlangan bo'lishi mumkin."
-                    : "Не удалось прочитать страницы книги. Возможно, файл поврежден."
+                    ? "Kitobni oqimli yuklab ochib bo'lmadi. Aloqani tekshirib qayta urining."
+                    : "Не удалось открыть книгу. Проверьте подключение к сети."
             );
         }
-    };
+    }, [productId, language]);
 
     // Trigger initial loading on mount
     useEffect(() => {
         startLoadingBook();
 
         return () => {
-            if (xhrRef.current) {
-                xhrRef.current.abort();
-            }
             if (leftRenderTaskRef.current) {
                 try { leftRenderTaskRef.current.cancel(); } catch (_) {}
             }
@@ -512,7 +499,7 @@ export function BookCanvasReader({
         : null;
 
     // ------------------------------------------------------------------------
-    // 3. Render Canvas Pages (HiDPI Retina + Realistic Book Scaling)
+    // 2. Render Canvas Pages (HiDPI Retina + Realistic Book Scaling)
     // ------------------------------------------------------------------------
     const renderSpread = useCallback(async () => {
         const doc = pdfDocRef.current;
@@ -538,6 +525,7 @@ export function BookCanvasReader({
             const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
 
             const isDouble = viewMode === "double" && !isNarrowScreen;
+            const canvasBgColor = paperTheme === "night" ? "#1E1E24" : paperTheme === "sepia" ? "#F5EEDB" : "#FFFFFF";
 
             if (isDouble) {
                 // Two-page realistic book layout
@@ -552,13 +540,13 @@ export function BookCanvasReader({
 
                 // Padding and spine width
                 const horizPadding = window.innerWidth < 1024 ? 32 : 64;
-                const vertPadding = 48;
+                const vertPadding = 80; // room for top and bottom bars
                 const spineWidth = 8;
 
                 const maxAvailableWidth = Math.max(220, (containerWidth - horizPadding - spineWidth) / 2);
                 const maxAvailableHeight = Math.max(300, containerHeight - vertPadding);
 
-                // Scale: Fit to page (contain both width & height) or fit-width
+                // Scale: Fit to page or fit-width
                 let baseScale = maxAvailableWidth / unscaledViewport.width;
                 if (!isFitWidth) {
                     const heightScale = maxAvailableHeight / unscaledViewport.height;
@@ -583,7 +571,7 @@ export function BookCanvasReader({
 
                     const ctx = canvas.getContext("2d", { alpha: false });
                     if (ctx) {
-                        ctx.fillStyle = paperTheme === "night" ? "#1E1E24" : paperTheme === "sepia" ? "#F9F6EE" : "#FFFFFF";
+                        ctx.fillStyle = canvasBgColor;
                         ctx.fillRect(0, 0, canvas.width, canvas.height);
                         const task = page.render({
                             canvasContext: ctx,
@@ -592,6 +580,10 @@ export function BookCanvasReader({
                         });
                         leftRenderTaskRef.current = task;
                         await task.promise;
+                        // Snapshot cache for 3D flip
+                        try {
+                            pageSnapshotsRef.current.set(leftNum, canvas.toDataURL("image/jpeg", 0.9));
+                        } catch (_) {}
                     }
                 }
 
@@ -607,7 +599,7 @@ export function BookCanvasReader({
 
                     const ctx = canvas.getContext("2d", { alpha: false });
                     if (ctx) {
-                        ctx.fillStyle = paperTheme === "night" ? "#1E1E24" : paperTheme === "sepia" ? "#F9F6EE" : "#FFFFFF";
+                        ctx.fillStyle = canvasBgColor;
                         ctx.fillRect(0, 0, canvas.width, canvas.height);
                         const task = page.render({
                             canvasContext: ctx,
@@ -616,8 +608,41 @@ export function BookCanvasReader({
                         });
                         rightRenderTaskRef.current = task;
                         await task.promise;
+                        // Snapshot cache for 3D flip
+                        try {
+                            pageSnapshotsRef.current.set(rightNum, canvas.toDataURL("image/jpeg", 0.9));
+                        } catch (_) {}
                     }
                 }
+
+                // Background idle prefetch of upcoming pages for instantaneous 0ms flip
+                setTimeout(async () => {
+                    const nextNum1 = (rightNum || 0) + 1;
+                    const nextNum2 = (rightNum || 0) + 2;
+                    for (const num of [nextNum1, nextNum2]) {
+                        if (num >= 1 && num <= totalPages && !pageSnapshotsRef.current.has(num)) {
+                            try {
+                                const p = await doc.getPage(num);
+                                const vp = p.getViewport({ scale: finalScale });
+                                const offCanvas = document.createElement("canvas");
+                                offCanvas.width = Math.floor(vp.width * dpr);
+                                offCanvas.height = Math.floor(vp.height * dpr);
+                                const offCtx = offCanvas.getContext("2d", { alpha: false });
+                                if (offCtx) {
+                                    offCtx.fillStyle = canvasBgColor;
+                                    offCtx.fillRect(0, 0, offCanvas.width, offCanvas.height);
+                                    await p.render({
+                                        canvasContext: offCtx,
+                                        viewport: vp,
+                                        transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
+                                    }).promise;
+                                    pageSnapshotsRef.current.set(num, offCanvas.toDataURL("image/jpeg", 0.85));
+                                }
+                            } catch (_) {}
+                        }
+                    }
+                }, 100);
+
             } else {
                 // Single-page clean view
                 if (singleCanvasRef.current) {
@@ -626,7 +651,7 @@ export function BookCanvasReader({
 
                     const padding = window.innerWidth < 640 ? 16 : 48;
                     const availableWidth = Math.max(260, containerWidth - padding);
-                    const availableHeight = Math.max(300, containerHeight - padding);
+                    const availableHeight = Math.max(300, containerHeight - padding - 60);
 
                     let baseScale = availableWidth / unscaledViewport.width;
                     if (!isFitWidth) {
@@ -645,7 +670,7 @@ export function BookCanvasReader({
 
                     const ctx = canvas.getContext("2d", { alpha: false });
                     if (ctx) {
-                        ctx.fillStyle = paperTheme === "night" ? "#1E1E24" : paperTheme === "sepia" ? "#F9F6EE" : "#FFFFFF";
+                        ctx.fillStyle = canvasBgColor;
                         ctx.fillRect(0, 0, canvas.width, canvas.height);
                         const task = page.render({
                             canvasContext: ctx,
@@ -654,12 +679,40 @@ export function BookCanvasReader({
                         });
                         singleRenderTaskRef.current = task;
                         await task.promise;
+                        try {
+                            pageSnapshotsRef.current.set(currentPage, canvas.toDataURL("image/jpeg", 0.9));
+                        } catch (_) {}
                     }
 
                     setRenderedDims({
                         width: Math.floor(viewport.width),
                         height: Math.floor(viewport.height),
                     });
+
+                    // Background prefetch next single page
+                    setTimeout(async () => {
+                        const nextP = currentPage + 1;
+                        if (nextP <= totalPages && !pageSnapshotsRef.current.has(nextP)) {
+                            try {
+                                const p = await doc.getPage(nextP);
+                                const vp = p.getViewport({ scale: finalScale });
+                                const offCanvas = document.createElement("canvas");
+                                offCanvas.width = Math.floor(vp.width * dpr);
+                                offCanvas.height = Math.floor(vp.height * dpr);
+                                const offCtx = offCanvas.getContext("2d", { alpha: false });
+                                if (offCtx) {
+                                    offCtx.fillStyle = canvasBgColor;
+                                    offCtx.fillRect(0, 0, offCanvas.width, offCanvas.height);
+                                    await p.render({
+                                        canvasContext: offCtx,
+                                        viewport: vp,
+                                        transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
+                                    }).promise;
+                                    pageSnapshotsRef.current.set(nextP, offCanvas.toDataURL("image/jpeg", 0.85));
+                                }
+                            } catch (_) {}
+                        }
+                    }, 100);
                 }
             }
 
@@ -670,7 +723,7 @@ export function BookCanvasReader({
                 localStorage.setItem(`book_page_${productId}`, String(currentPage));
             } catch (_) {}
 
-            // Smoothly align scroll after double-tap zoom to focus on tapped paragraph
+            // Smoothly align scroll after double-tap zoom
             if (pendingScrollCenterRef.current && scrollContainerRef.current) {
                 const { x, y } = pendingScrollCenterRef.current;
                 setTimeout(() => {
@@ -720,55 +773,110 @@ export function BookCanvasReader({
     }, [status, renderSpread]);
 
     // ------------------------------------------------------------------------
-    // 4. Navigation Actions with 3D Flip & Sound
+    // 3. True 3D Flip Mechanics without Black Gaps (Underlying Page Pre-rendered)
     // ------------------------------------------------------------------------
-    const triggerFlipAnimation = (direction: "next" | "prev", onComplete: () => void) => {
+    const goToNextPage = useCallback(() => {
+        if (currentPage >= totalPages || isFlipping) return;
+
         if (isSoundEnabled) {
             paperSound.play();
         }
 
+        // Calculate next target page and underlying snapshot
+        let nextTargetPage: number;
+        let underlyingNum: number | null = null;
+        let backNum: number | null = null;
+        let frontSnapshot: string | null = null;
+
+        if (effectiveIsDouble) {
+            if (currentPage === 1) {
+                nextTargetPage = 2;
+                backNum = 2;
+                underlyingNum = 3 <= totalPages ? 3 : null;
+            } else {
+                const left = currentPage % 2 === 0 ? currentPage : currentPage - 1;
+                nextTargetPage = Math.min(totalPages, left + 2);
+                backNum = left + 2 <= totalPages ? left + 2 : null;
+                underlyingNum = left + 3 <= totalPages ? left + 3 : null;
+            }
+            frontSnapshot = rightCanvasRef.current ? rightCanvasRef.current.toDataURL() : (pageSnapshotsRef.current.get(rightPageNum || 1) || null);
+        } else {
+            nextTargetPage = Math.min(totalPages, currentPage + 1);
+            underlyingNum = nextTargetPage;
+            frontSnapshot = singleCanvasRef.current ? singleCanvasRef.current.toDataURL() : (pageSnapshotsRef.current.get(currentPage) || null);
+        }
+
+        const backSnapshot = backNum ? (pageSnapshotsRef.current.get(backNum) || null) : null;
+        const underlyingSnapshot = underlyingNum ? (pageSnapshotsRef.current.get(underlyingNum) || null) : null;
+
+        setFlipState({
+            direction: "next",
+            frontSnapshot,
+            backSnapshot,
+            underlyingSnapshot,
+            underlyingPageNum: underlyingNum,
+            backPageNum: backNum,
+        });
+
         setIsFlipping(true);
-        setFlipDirection(direction);
 
         setTimeout(() => {
-            onComplete();
+            setCurrentPage(nextTargetPage);
             setIsFlipping(false);
-            setFlipDirection(null);
-        }, 360);
-    };
+            setFlipState(null);
+        }, 400);
+    }, [currentPage, totalPages, isFlipping, effectiveIsDouble, rightPageNum, isSoundEnabled]);
 
     const goToPrevPage = useCallback(() => {
         if (currentPage <= 1 || isFlipping) return;
 
-        triggerFlipAnimation("prev", () => {
-            setCurrentPage((prev) => {
-                if (effectiveIsDouble) {
-                    if (prev <= 2) return 1;
-                    const left = prev % 2 === 0 ? prev : prev - 1;
-                    return Math.max(1, left - 2);
-                } else {
-                    return Math.max(1, prev - 1);
-                }
-            });
-        });
-    }, [currentPage, isFlipping, effectiveIsDouble, isSoundEnabled]);
+        if (isSoundEnabled) {
+            paperSound.play();
+        }
 
-    const goToNextPage = useCallback(() => {
-        if (currentPage >= totalPages || isFlipping) return;
+        let prevTargetPage: number;
+        let underlyingNum: number | null = null;
+        let backNum: number | null = null;
+        let frontSnapshot: string | null = null;
 
-        triggerFlipAnimation("next", () => {
-            setCurrentPage((prev) => {
-                if (effectiveIsDouble) {
-                    if (prev === 1) return 2;
-                    const left = prev % 2 === 0 ? prev : prev - 1;
-                    const next = left + 2;
-                    return next <= totalPages ? next : totalPages;
-                } else {
-                    return Math.min(totalPages, prev + 1);
-                }
-            });
+        if (effectiveIsDouble) {
+            if (currentPage <= 2) {
+                prevTargetPage = 1;
+                backNum = 1;
+                underlyingNum = null;
+            } else {
+                const left = currentPage % 2 === 0 ? currentPage : currentPage - 1;
+                prevTargetPage = Math.max(1, left - 2);
+                backNum = left - 1;
+                underlyingNum = prevTargetPage;
+            }
+            frontSnapshot = leftCanvasRef.current ? leftCanvasRef.current.toDataURL() : (pageSnapshotsRef.current.get(leftPageNum || 1) || null);
+        } else {
+            prevTargetPage = Math.max(1, currentPage - 1);
+            underlyingNum = prevTargetPage;
+            frontSnapshot = singleCanvasRef.current ? singleCanvasRef.current.toDataURL() : (pageSnapshotsRef.current.get(currentPage) || null);
+        }
+
+        const backSnapshot = backNum ? (pageSnapshotsRef.current.get(backNum) || null) : null;
+        const underlyingSnapshot = underlyingNum ? (pageSnapshotsRef.current.get(underlyingNum) || null) : null;
+
+        setFlipState({
+            direction: "prev",
+            frontSnapshot,
+            backSnapshot,
+            underlyingSnapshot,
+            underlyingPageNum: underlyingNum,
+            backPageNum: backNum,
         });
-    }, [currentPage, totalPages, isFlipping, effectiveIsDouble, isSoundEnabled]);
+
+        setIsFlipping(true);
+
+        setTimeout(() => {
+            setCurrentPage(prevTargetPage);
+            setIsFlipping(false);
+            setFlipState(null);
+        }, 400);
+    }, [currentPage, isFlipping, effectiveIsDouble, leftPageNum, isSoundEnabled]);
 
     const handlePageInputSubmit = (e: React.FormEvent) => {
         e.preventDefault();
@@ -782,7 +890,7 @@ export function BookCanvasReader({
     };
 
     // ------------------------------------------------------------------------
-    // 5. Zoom & Reading Comfort Controls
+    // 4. Zoom & Reading Comfort Controls
     // ------------------------------------------------------------------------
     const handleZoomIn = () => {
         setIsFitWidth(false);
@@ -799,7 +907,6 @@ export function BookCanvasReader({
             setIsFitWidth(false);
             setZoom(1.0);
         } else if (zoom !== 1.0) {
-            // Agar zoom qilingan bo'lsa, bosganda 1.0x ga reset bo'ladi
             setZoom(1.0);
             setIsFitWidth(false);
         } else {
@@ -814,12 +921,10 @@ export function BookCanvasReader({
         if (!container) return;
 
         if (zoom > 1.25) {
-            // Normal 1.0x holatiga qaytarish
             setZoom(1.0);
             setIsFitWidth(false);
             container.scrollTo({ top: 0, behavior: "smooth" });
         } else {
-            // Harflarni qulay o'qish uchun 1.9x ga kattalashtirish va bosilgan nuqtani markazga olish
             const targetZoom = 1.9;
             const rect = container.getBoundingClientRect();
             const clickRelX = clientX - rect.left;
@@ -854,6 +959,7 @@ export function BookCanvasReader({
     // Paper Theme Toggle
     const handleSetTheme = (theme: PaperTheme) => {
         setPaperTheme(theme);
+        setShowThemeMenu(false);
         try {
             localStorage.setItem("kutubxona_reader_theme", theme);
         } catch (_) {}
@@ -936,7 +1042,6 @@ export function BookCanvasReader({
     // Touch Events: Double-Tap, Pinch-to-Zoom & Swipe Navigation
     // ------------------------------------------------------------------------
     const handleTouchStart = (e: React.TouchEvent) => {
-        // 2 barmoq: Pinch Zoom boshlanishi
         if (e.touches.length === 2) {
             isPinchingRef.current = true;
             const dist = Math.hypot(
@@ -950,7 +1055,6 @@ export function BookCanvasReader({
             return;
         }
 
-        // 1 barmoq: Swipe koordinatasi va Double-Tap hisobi
         if (e.touches.length === 1) {
             touchStartCoords.current = {
                 x: e.touches[0].clientX,
@@ -960,7 +1064,6 @@ export function BookCanvasReader({
     };
 
     const handleTouchMove = (e: React.TouchEvent) => {
-        // Pinch harakati davom etmoqda (60 FPS smooth visual feedback)
         if (isPinchingRef.current && e.touches.length === 2) {
             const dist = Math.hypot(
                 e.touches[0].clientX - e.touches[1].clientX,
@@ -975,7 +1078,6 @@ export function BookCanvasReader({
     };
 
     const handleTouchEnd = (e: React.TouchEvent) => {
-        // Pinch tugashi: Barmoqlar ko'tarilganda yangi aniq PDF zoom o'rnatiladi
         if (isPinchingRef.current) {
             isPinchingRef.current = false;
             const finalFactor = pinchCurrentFactorRef.current;
@@ -991,7 +1093,6 @@ export function BookCanvasReader({
             return;
         }
 
-        // Double-Tap detektori (mobil qurilmalar uchun)
         const touch = e.changedTouches[0];
         if (touch) {
             const now = Date.now();
@@ -999,7 +1100,6 @@ export function BookCanvasReader({
                 const dx = Math.abs(touch.clientX - lastTapRef.current.x);
                 const dy = Math.abs(touch.clientY - lastTapRef.current.y);
                 if (dx < 40 && dy < 40) {
-                    // Double Tap muvaffaqiyatli aniqlandi!
                     handleDoubleTapZoom(touch.clientX, touch.clientY);
                     lastTapRef.current = null;
                     touchStartCoords.current = null;
@@ -1009,18 +1109,15 @@ export function BookCanvasReader({
             lastTapRef.current = { time: now, x: touch.clientX, y: touch.clientY };
         }
 
-        // Swipe varaqlash (Faqat normal zoomda — kattalashgan matnni o'qish paytida to'sqinlik qilmasligi uchun)
         if (!touchStartCoords.current || !touch) return;
         const diffX = touch.clientX - touchStartCoords.current.x;
         const diffY = touch.clientY - touchStartCoords.current.y;
         touchStartCoords.current = null;
 
-        // Agar zoom qilingan bo'lsa (zoom > 1.2), foydalanuvchi matnni bemalol skroll qilib o'qiydi
         if (zoom > 1.2) {
             return;
         }
 
-        // Minimum swipe masofasi 50px, gorizontal harakat dominant
         if (Math.abs(diffX) > 50 && Math.abs(diffX) > Math.abs(diffY) * 1.4) {
             if (diffX < 0) {
                 goToNextPage();
@@ -1034,7 +1131,8 @@ export function BookCanvasReader({
     const getThemePaperFilter = () => {
         switch (paperTheme) {
             case "sepia":
-                return "sepia(0.24) contrast(0.97) brightness(0.98)";
+                // Rich, warm vintage paper filter: deeply saturated and eye-friendly
+                return "sepia(0.68) contrast(0.94) brightness(0.96) saturate(1.4)";
             case "night":
                 return "invert(0.91) hue-rotate(180deg) contrast(1.1) brightness(0.92)";
             case "white":
@@ -1043,33 +1141,28 @@ export function BookCanvasReader({
         }
     };
 
-    const getThemeContainerBg = () => {
+    const getThemePaperBgColor = () => {
         switch (paperTheme) {
             case "sepia":
-                return "bg-[#181D17]";
+                return "#F5EEDB";
             case "night":
-                return "bg-[#0C0D10]";
+                return "#1E1E24";
             case "white":
             default:
-                return "bg-[#131914]";
+                return "#FFFFFF";
         }
     };
 
-    // Format Page Indicator label
-    const getPageDisplayLabel = () => {
-        if (!effectiveIsDouble) {
-            return `${currentPage} / ${totalPages}`;
+    const getThemeContainerBg = () => {
+        switch (paperTheme) {
+            case "sepia":
+                return "bg-[#14120E]";
+            case "night":
+                return "bg-[#0A0B0E]";
+            case "white":
+            default:
+                return "bg-[#111417]";
         }
-        if (isCover) {
-            return `1 / ${totalPages}`;
-        }
-        if (leftPageNum && rightPageNum) {
-            return `${leftPageNum}-${rightPageNum} / ${totalPages}`;
-        }
-        if (leftPageNum) {
-            return `${leftPageNum} / ${totalPages}`;
-        }
-        return `${currentPage} / ${totalPages}`;
     };
 
     return (
@@ -1081,254 +1174,155 @@ export function BookCanvasReader({
             aria-label={bookTitle}
             onContextMenu={(e) => e.preventDefault()}
         >
-            {/* CSS Animation Keyframes for realistic 3D page flip */}
+            {/* CSS Animation Keyframes for Realistic 3D Page Flip with Front & Backfaces */}
             <style jsx>{`
-                @keyframes flipNext {
+                .book-scene {
+                    perspective: 2600px;
+                    transform-style: preserve-3d;
+                }
+                .book-leaf {
+                    position: absolute;
+                    top: 0;
+                    bottom: 0;
+                    width: 100%;
+                    height: 100%;
+                    transform-style: preserve-3d;
+                }
+                .leaf-face {
+                    position: absolute;
+                    inset: 0;
+                    backface-visibility: hidden;
+                    -webkit-backface-visibility: hidden;
+                    overflow: hidden;
+                }
+                .leaf-back {
+                    transform: rotateY(180deg);
+                }
+                @keyframes flipNext3D {
                     0% {
                         transform: rotateY(0deg);
-                        filter: brightness(1);
-                    }
-                    50% {
-                        transform: rotateY(-90deg) scale(0.98);
-                        filter: brightness(0.75);
                     }
                     100% {
                         transform: rotateY(-180deg);
-                        filter: brightness(1);
                     }
                 }
-                @keyframes flipPrev {
+                @keyframes flipPrev3D {
                     0% {
                         transform: rotateY(0deg);
-                        filter: brightness(1);
-                    }
-                    50% {
-                        transform: rotateY(90deg) scale(0.98);
-                        filter: brightness(0.75);
                     }
                     100% {
                         transform: rotateY(180deg);
-                        filter: brightness(1);
                     }
                 }
-                .anim-flip-next {
+                .anim-flip-leaf-next {
                     transform-origin: left center;
-                    animation: flipNext 360ms cubic-bezier(0.25, 1, 0.5, 1) forwards;
-                    backface-visibility: hidden;
+                    animation: flipNext3D 400ms cubic-bezier(0.24, 0.85, 0.32, 1) forwards;
                 }
-                .anim-flip-prev {
+                .anim-flip-leaf-prev {
                     transform-origin: right center;
-                    animation: flipPrev 360ms cubic-bezier(0.25, 1, 0.5, 1) forwards;
-                    backface-visibility: hidden;
+                    animation: flipPrev3D 400ms cubic-bezier(0.24, 0.85, 0.32, 1) forwards;
                 }
             `}</style>
 
             {/* =============================================================== */}
-            {/* TOP HEADER BAR */}
+            {/* 1. TOP HEADER BAR: Minimal & Clean (Title + Theme, FS, Close) */}
             {/* =============================================================== */}
-            <header className="h-14 sm:h-16 bg-[#161E17]/95 backdrop-blur-md border-b border-white/10 px-2 sm:px-5 flex items-center justify-between gap-1.5 sm:gap-2 shrink-0 shadow-lg z-30">
-                {/* Left: Book Icon & Title */}
-                <div className="flex items-center gap-1.5 sm:gap-3 min-w-0 max-w-[28%] sm:max-w-xs md:max-w-sm">
-                    <div className="w-7 h-7 sm:w-9 sm:h-9 rounded-xl bg-emerald-500/15 text-emerald-400 flex items-center justify-center shrink-0 border border-emerald-500/25 shadow-sm">
-                        <BookOpen size={16} className="sm:w-[18px] sm:h-[18px]" strokeWidth={2.4} />
+            <header className="h-14 bg-[#14120E]/95 backdrop-blur-md border-b border-white/10 px-3 sm:px-6 flex items-center justify-between gap-3 shrink-0 shadow-md z-40">
+                {/* Left: Book Title & Status Pill */}
+                <div className="flex items-center gap-2.5 min-w-0 max-w-[55%] sm:max-w-md md:max-w-xl">
+                    <div className="w-8 h-8 rounded-xl bg-emerald-500/15 text-emerald-400 flex items-center justify-center shrink-0 border border-emerald-500/25 shadow-sm">
+                        <BookOpen size={17} strokeWidth={2.4} />
                     </div>
                     <div className="min-w-0">
-                        <h2
+                        <h1
                             className="text-xs sm:text-sm font-bold text-white truncate"
                             title={bookTitle}
                         >
                             {bookTitle}
-                        </h2>
-                        <div className="flex items-center gap-2 text-[9px] sm:text-[11px] font-medium text-emerald-400 mt-0.5">
+                        </h1>
+                        <div className="flex items-center gap-2 text-[10px] text-emerald-400 font-medium">
                             <span className="flex items-center gap-1">
                                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                                <span className="hidden xs:inline">{language === "uz" ? "Kitob mutolaasi" : "Книжный ридер"}</span>
+                                <span>{language === "uz" ? "Elektron kitob" : "Электронная книга"}</span>
                             </span>
-                            {isFromCache && (
-                                <span className="hidden md:inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded-full bg-emerald-500/20 text-emerald-300 text-[9px] font-semibold">
+                            {isFromCache ? (
+                                <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded-full bg-emerald-500/20 text-emerald-300 text-[9px] font-semibold">
                                     <Zap size={10} className="text-yellow-400 fill-yellow-400" />
-                                    {language === "uz" ? "Keshdan" : "Кэш"}
+                                    <span>{language === "uz" ? "Oflayn kesh" : "Кэш"}</span>
+                                </span>
+                            ) : (
+                                <span className="hidden xs:inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded-full bg-blue-500/20 text-blue-300 text-[9px] font-semibold">
+                                    <Sparkles size={10} className="text-blue-400" />
+                                    <span>{language === "uz" ? "Tezkor oqim" : "Стриминг"}</span>
                                 </span>
                             )}
                         </div>
                     </div>
                 </div>
 
-                {/* Center: Page Navigation (Only shown when ready) */}
-                {status === "ready" && totalPages > 0 && (
-                    <div className="flex items-center gap-0.5 sm:gap-1.5 bg-black/35 border border-white/10 rounded-xl px-1 py-0.5 sm:px-2 sm:py-1 shadow-inner">
+                {/* Right: Theme Selector + Fullscreen + Close */}
+                <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                    {/* Theme Picker Dropdown / Switcher */}
+                    <div className="relative">
                         <button
-                            onClick={goToPrevPage}
-                            disabled={currentPage <= 1 || isFlipping}
-                            className="p-1 sm:p-1.5 rounded-lg text-gray-300 hover:text-white hover:bg-white/10 disabled:opacity-25 disabled:hover:bg-transparent active:scale-95 transition-all"
-                            title={language === "uz" ? "Oldingi sahifa (ArrowLeft)" : "Предыдущая (ArrowLeft)"}
-                            aria-label="Previous Page"
+                            onClick={() => setShowThemeMenu((v) => !v)}
+                            className="h-9 px-2.5 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-gray-200 hover:text-white text-xs font-semibold flex items-center gap-1.5 active:scale-95 transition-all"
+                            title={language === "uz" ? "Kitob qog'ozi rangi" : "Цвет бумаги"}
+                            aria-label="Theme selector"
                         >
-                            <ChevronLeft size={16} className="sm:w-[17px] sm:h-[17px]" strokeWidth={2.5} />
-                        </button>
-
-                        <form onSubmit={handlePageInputSubmit} className="flex items-center gap-0.5 sm:gap-1 text-xs font-semibold px-0.5">
-                            <input
-                                type="text"
-                                inputMode="numeric"
-                                pattern="[0-9]*"
-                                value={pageInputValue}
-                                onChange={(e) => setPageInputValue(e.target.value)}
-                                onBlur={handlePageInputSubmit}
-                                className="w-7 sm:w-11 text-center bg-black/50 border border-white/20 rounded-md py-0.5 text-xs font-bold text-white focus:outline-none focus:border-emerald-500 transition-colors"
+                            <span
+                                className="w-3.5 h-3.5 rounded-full border border-black/20 shadow-xs shrink-0"
+                                style={{ backgroundColor: getThemePaperBgColor() }}
                             />
-                            <span className="text-gray-400">/</span>
-                            <span className="text-gray-200 text-xs">{totalPages}</span>
-                        </form>
-
-                        <button
-                            onClick={goToNextPage}
-                            disabled={currentPage >= totalPages || isFlipping}
-                            className="p-1 sm:p-1.5 rounded-lg text-gray-300 hover:text-white hover:bg-white/10 disabled:opacity-25 disabled:hover:bg-transparent active:scale-95 transition-all"
-                            title={language === "uz" ? "Keyingi sahifa (ArrowRight)" : "Следующая (ArrowRight)"}
-                            aria-label="Next Page"
-                        >
-                            <ChevronRight size={16} className="sm:w-[17px] sm:h-[17px]" strokeWidth={2.5} />
+                            <span className="hidden sm:inline capitalize">
+                                {paperTheme === "sepia" ? "Sepia" : paperTheme === "white" ? (language === "uz" ? "Oq" : "Белая") : (language === "uz" ? "Tungi" : "Ночь")}
+                            </span>
                         </button>
+
+                        {/* Theme Popup Menu */}
+                        {showThemeMenu && (
+                            <div className="absolute right-0 top-11 z-50 bg-[#1C1814] border border-white/15 rounded-2xl p-1.5 shadow-2xl flex flex-col gap-1 min-w-[140px] animate-in fade-in zoom-in-95 duration-150">
+                                <button
+                                    onClick={() => handleSetTheme("sepia")}
+                                    className={`px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-2.5 transition-colors ${
+                                        paperTheme === "sepia"
+                                            ? "bg-[#F5EEDB] text-[#2C2416] font-bold shadow-sm"
+                                            : "text-gray-300 hover:bg-white/10"
+                                    }`}
+                                >
+                                    <span className="w-3.5 h-3.5 rounded-full bg-[#F5EEDB] border border-[#C5B496]" />
+                                    <span>{language === "uz" ? "Issiq Sepia" : "Сепия"}</span>
+                                </button>
+                                <button
+                                    onClick={() => handleSetTheme("white")}
+                                    className={`px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-2.5 transition-colors ${
+                                        paperTheme === "white"
+                                            ? "bg-white text-gray-900 font-bold shadow-sm"
+                                            : "text-gray-300 hover:bg-white/10"
+                                    }`}
+                                >
+                                    <Sun size={14} className="text-amber-500" />
+                                    <span>{language === "uz" ? "Oq qog'oz" : "Белая"}</span>
+                                </button>
+                                <button
+                                    onClick={() => handleSetTheme("night")}
+                                    className={`px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-2.5 transition-colors ${
+                                        paperTheme === "night"
+                                            ? "bg-indigo-950 text-indigo-200 border border-indigo-700/50 font-bold shadow-sm"
+                                            : "text-gray-300 hover:bg-white/10"
+                                    }`}
+                                >
+                                    <Moon size={14} className="text-indigo-300" />
+                                    <span>{language === "uz" ? "Tungi rejim" : "Ночной"}</span>
+                                </button>
+                            </div>
+                        )}
                     </div>
-                )}
-
-                {/* Right: Controls, Zoom & Options */}
-                <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
-                    {/* ZOOM BOSHQRUVI: +, -, Fit Width (Mobil, planshet va kompyuterda ko'rinadi) */}
-                    {status === "ready" && (
-                        <div className="flex items-center gap-0.5 bg-black/40 border border-white/10 rounded-xl p-0.5 shadow-inner">
-                            <button
-                                onClick={handleZoomOut}
-                                className="p-1 sm:p-1.5 rounded-lg text-gray-300 hover:text-white hover:bg-white/10 active:scale-95 transition-colors"
-                                title={language === "uz" ? "Kichraytirish (-)" : "Уменьшить (-)"}
-                                aria-label="Zoom Out"
-                            >
-                                <ZoomOut size={14} />
-                            </button>
-                            <button
-                                onClick={handleToggleFitWidth}
-                                className={`px-1.5 sm:px-2 py-1 rounded-lg text-[10px] sm:text-[11px] font-bold transition-colors ${
-                                    isFitWidth
-                                        ? "bg-emerald-600 text-white shadow-sm"
-                                        : zoom > 1.15
-                                            ? "bg-emerald-500/25 text-emerald-300 font-extrabold"
-                                            : "text-gray-300 hover:text-white"
-                                }`}
-                                title={
-                                    language === "uz"
-                                        ? "Kenglikka moslash / Kattalashtirish (Bosing: 100% ga qaytaradi)"
-                                        : "По ширине / Масштаб"
-                                }
-                            >
-                                {isFitWidth ? (language === "uz" ? "Kenglik" : "Ширина") : `${Math.round(zoom * 100)}%`}
-                            </button>
-                            <button
-                                onClick={handleZoomIn}
-                                className="p-1 sm:p-1.5 rounded-lg text-gray-300 hover:text-white hover:bg-white/10 active:scale-95 transition-colors"
-                                title={language === "uz" ? "Kattalashtirish (+)" : "Увеличить (+)"}
-                                aria-label="Zoom In"
-                            >
-                                <ZoomIn size={14} />
-                            </button>
-                        </div>
-                    )}
-
-                    {/* View Mode Switcher: 2 Pages (Book) vs 1 Page (Single) */}
-                    {status === "ready" && !isNarrowScreen && (
-                        <button
-                            onClick={toggleViewMode}
-                            className="hidden md:flex px-2 py-1.5 sm:px-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-gray-200 hover:text-white text-xs font-medium items-center gap-1.5 active:scale-95 transition-all"
-                            title={
-                                viewMode === "double"
-                                    ? language === "uz" ? "Yakka sahifa rejimiga o'tish" : "Перейти в одну страницу"
-                                    : language === "uz" ? "Kitob ko'rinishiga (2 sahifa) o'tish" : "Перейти в 2 страницы (книга)"
-                            }
-                        >
-                            {viewMode === "double" ? (
-                                <>
-                                    <Book size={15} className="text-emerald-400" />
-                                    <span className="hidden lg:inline text-[11px] font-semibold">
-                                        {language === "uz" ? "Kitob (2 sahifa)" : "Разворот (2 стр)"}
-                                    </span>
-                                </>
-                            ) : (
-                                <>
-                                    <FileText size={15} className="text-blue-400" />
-                                    <span className="hidden lg:inline text-[11px] font-semibold">
-                                        {language === "uz" ? "Yakka sahifa" : "Одна страница"}
-                                    </span>
-                                </>
-                            )}
-                        </button>
-                    )}
-
-                    {/* Paper Theme Picker: Sepia, White, Night */}
-                    {status === "ready" && (
-                        <div className="flex items-center gap-0.5 bg-black/40 border border-white/10 rounded-xl p-0.5">
-                            <button
-                                onClick={() => handleSetTheme("sepia")}
-                                className={`px-1.5 sm:px-2 py-1 rounded-lg text-[10px] sm:text-[11px] font-bold flex items-center gap-1 transition-all ${
-                                    paperTheme === "sepia"
-                                        ? "bg-[#D9CDB8] text-[#2C2416] shadow-sm font-extrabold"
-                                        : "text-gray-400 hover:text-white"
-                                }`}
-                                title={language === "uz" ? "Kitob qog'ozi (Issiq Sepia)" : "Книжная бумага (Сепия)"}
-                            >
-                                <span className="w-2.5 h-2.5 rounded-full bg-[#E5D7BC] border border-[#AFA085]" />
-                                <span className="hidden lg:inline">{language === "uz" ? "Sepia" : "Сепия"}</span>
-                            </button>
-                            <button
-                                onClick={() => handleSetTheme("white")}
-                                className={`px-1.5 sm:px-2 py-1 rounded-lg text-[10px] sm:text-[11px] font-bold flex items-center gap-1 transition-all ${
-                                    paperTheme === "white"
-                                        ? "bg-white text-gray-900 shadow-sm font-extrabold"
-                                        : "text-gray-400 hover:text-white"
-                                }`}
-                                title={language === "uz" ? "Oq qog'oz" : "Белая бумага"}
-                            >
-                                <Sun size={12} className={paperTheme === "white" ? "text-amber-500" : "text-gray-400"} />
-                                <span className="hidden lg:inline">{language === "uz" ? "Oq" : "Белая"}</span>
-                            </button>
-                            <button
-                                onClick={() => handleSetTheme("night")}
-                                className={`px-1.5 sm:px-2 py-1 rounded-lg text-[10px] sm:text-[11px] font-bold flex items-center gap-1 transition-all ${
-                                    paperTheme === "night"
-                                        ? "bg-indigo-950 text-indigo-200 border border-indigo-700/50 shadow-sm font-extrabold"
-                                        : "text-gray-400 hover:text-white"
-                                }`}
-                                title={language === "uz" ? "Tungi rejim" : "Ночной режим"}
-                            >
-                                <Moon size={12} className={paperTheme === "night" ? "text-indigo-300" : "text-gray-400"} />
-                                <span className="hidden lg:inline">{language === "uz" ? "Tungi" : "Ночь"}</span>
-                            </button>
-                        </div>
-                    )}
-
-                    {/* Paper Turn Sound Toggle */}
-                    {status === "ready" && (
-                        <button
-                            onClick={toggleSound}
-                            className={`p-1.5 sm:p-2 rounded-xl border border-white/10 active:scale-95 transition-all ${
-                                isSoundEnabled
-                                    ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
-                                    : "bg-white/5 text-gray-400 hover:text-white"
-                            }`}
-                            title={
-                                isSoundEnabled
-                                    ? language === "uz" ? "Varaqlash tovushi: Yoqiq" : "Звук страниц: Вкл"
-                                    : language === "uz" ? "Varaqlash tovushi: O'chiq" : "Звук страниц: Выкл"
-                            }
-                            aria-label="Toggle Sound"
-                        >
-                            {isSoundEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
-                        </button>
-                    )}
 
                     {/* Fullscreen Toggle */}
                     <button
                         onClick={toggleFullscreen}
-                        className="hidden sm:flex p-2 rounded-xl bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white text-xs font-medium items-center gap-1.5 active:scale-95 transition-colors"
+                        className="h-9 w-9 rounded-xl bg-white/10 hover:bg-white/15 text-gray-300 hover:text-white flex items-center justify-center active:scale-95 transition-colors"
                         title={
                             isFullscreen
                                 ? language === "uz" ? "Oyna rejimiga qaytish" : "Оконный режим"
@@ -1346,7 +1340,7 @@ export function BookCanvasReader({
                             }
                             onClose();
                         }}
-                        className="p-1.5 sm:p-2 rounded-xl bg-white/10 hover:bg-red-500/80 active:scale-95 text-white flex items-center justify-center transition-colors ml-0.5"
+                        className="h-9 w-9 rounded-xl bg-white/10 hover:bg-red-500/85 active:scale-95 text-white flex items-center justify-center transition-colors"
                         title={language === "uz" ? "Yopish (Esc)" : "Закрыть (Esc)"}
                     >
                         <X size={18} strokeWidth={2.4} />
@@ -1355,7 +1349,7 @@ export function BookCanvasReader({
             </header>
 
             {/* =============================================================== */}
-            {/* READER MAIN CANVAS SPREAD OR LOADING SCREEN */}
+            {/* MAIN CANVAS SPREAD OR LOADING SCREEN */}
             {/* =============================================================== */}
             <main
                 ref={scrollContainerRef}
@@ -1363,19 +1357,21 @@ export function BookCanvasReader({
                 onTouchMove={handleTouchMove}
                 onTouchEnd={handleTouchEnd}
                 onDoubleClick={(e) => handleDoubleTapZoom(e.clientX, e.clientY)}
-                className={`flex-1 w-full h-full relative overflow-auto flex flex-col items-center justify-start py-4 sm:py-6 px-2 sm:px-4 ${
+                onClick={() => {
+                    if (showThemeMenu) setShowThemeMenu(false);
+                }}
+                className={`flex-1 w-full h-full relative overflow-auto flex flex-col items-center justify-start pt-4 pb-28 sm:pb-24 px-2 sm:px-4 ${
                     zoom > 1.25 ? "cursor-zoom-out" : "cursor-zoom-in"
                 }`}
                 style={{
                     WebkitOverflowScrolling: "touch",
-                    perspective: "2200px",
+                    perspective: "2600px",
                 }}
             >
-                {/* 1. CHECKING / DOWNLOADING SCREEN WITH REAL-TIME PROGRESS */}
+                {/* 1. PROGRESSIVE STREAMING LOADING INDICATOR */}
                 {(status === "checking" || status === "downloading" || status === "rendering") && (
-                    <div className="my-auto flex flex-col items-center justify-center p-6 sm:p-8 max-w-sm sm:max-w-md w-full bg-[#182119] border border-white/10 rounded-3xl shadow-2xl text-center animate-in zoom-in-95 duration-200">
-                        {/* Book Cover or Icon */}
-                        <div className="w-20 h-28 sm:w-24 sm:h-32 rounded-2xl overflow-hidden shadow-2xl border-2 border-emerald-500/30 bg-black/40 mb-5 relative flex items-center justify-center">
+                    <div className="my-auto flex flex-col items-center justify-center p-6 sm:p-8 max-w-sm sm:max-w-md w-full bg-[#181512] border border-white/10 rounded-3xl shadow-2xl text-center animate-in zoom-in-95 duration-200">
+                        <div className="w-20 h-28 sm:w-24 sm:h-32 rounded-2xl overflow-hidden shadow-2xl border-2 border-emerald-500/30 bg-black/40 mb-4 relative flex items-center justify-center">
                             {coverUrl ? (
                                 <img
                                     src={coverUrl}
@@ -1388,16 +1384,14 @@ export function BookCanvasReader({
                             <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent pointer-events-none" />
                         </div>
 
-                        {/* Title */}
-                        <h3 className="text-sm sm:text-base font-bold text-white mb-1 line-clamp-2">
+                        <h2 className="text-sm sm:text-base font-bold text-white mb-1 line-clamp-2">
                             {bookTitle}
-                        </h3>
+                        </h2>
 
-                        {/* Status text & bar */}
                         {status === "checking" && (
                             <p className="text-xs text-gray-400 mt-2 flex items-center gap-1.5">
                                 <Loader2 size={14} className="animate-spin text-emerald-400" />
-                                {language === "uz" ? "Xotira kesh tekshirilmoqda..." : "Проверка кэша книги..."}
+                                {language === "uz" ? "Tezkor mutolaa tayyorlanmoqda..." : "Подготовка книги..."}
                             </p>
                         )}
 
@@ -1406,32 +1400,26 @@ export function BookCanvasReader({
                                 <div className="flex items-center justify-between text-xs font-semibold text-gray-300 mb-2">
                                     <span className="flex items-center gap-1.5 text-emerald-400">
                                         <Loader2 size={13} className="animate-spin" />
-                                        {language === "uz" ? "Kitob yuklanmoqda..." : "Загрузка книги..."}
+                                        {language === "uz" ? "Birinchi sahifalar ochilmoqda..." : "Открытие страниц..."}
                                     </span>
-                                    <span className="font-bold text-white text-sm">
-                                        {downloadPercent}%
+                                    <span className="font-bold text-white text-xs">
+                                        {downloadPercent > 0 ? `${downloadPercent}%` : "Oqimli"}
                                     </span>
                                 </div>
-
-                                {/* Animated Emerald Progress Bar */}
-                                <div className="w-full h-3 bg-white/10 rounded-full overflow-hidden p-0.5 shadow-inner">
+                                <div className="w-full h-2.5 bg-white/10 rounded-full overflow-hidden p-0.5 shadow-inner">
                                     <div
                                         className="h-full bg-gradient-to-r from-emerald-500 via-green-400 to-emerald-400 rounded-full transition-all duration-200 ease-out relative overflow-hidden"
-                                        style={{ width: `${Math.max(5, downloadPercent)}%` }}
+                                        style={{ width: `${Math.max(15, downloadPercent)}%` }}
                                     >
                                         <div className="absolute inset-0 bg-white/25 animate-pulse" />
                                     </div>
                                 </div>
-
-                                {/* Downloaded size indicator */}
-                                <div className="flex items-center justify-between mt-2.5 text-[11px] text-gray-400">
+                                <div className="flex items-center justify-between mt-2 text-[10px] text-gray-400">
                                     <span>
-                                        {totalBytes > 0
-                                            ? `${formatBytes(loadedBytes)} / ${formatBytes(totalBytes)}`
-                                            : `${formatBytes(loadedBytes)} ${language === "uz" ? "yuklandi" : "загружено"}`}
+                                        {loadedBytes > 0 ? `${formatBytes(loadedBytes)}` : "Tezkor ochish (0.5s)"}
                                     </span>
-                                    <span className="text-[10px] text-emerald-400/90 font-medium">
-                                        {language === "uz" ? "Keshga saqlanadi" : "В кэш"}
+                                    <span className="text-emerald-400 font-medium">
+                                        {language === "uz" ? "Darhol boshlanadi" : "Мгновенный старт"}
                                     </span>
                                 </div>
                             </div>
@@ -1441,20 +1429,13 @@ export function BookCanvasReader({
                             <div className="mt-4 flex flex-col items-center gap-2">
                                 <div className="flex items-center gap-2 text-xs font-semibold text-emerald-400">
                                     <CheckCircle2 size={16} />
-                                    {language === "uz" ? "Haqiqiy sahifalar tayyorlanmoqda..." : "Подготовка страниц книги..."}
+                                    {language === "uz" ? "Haqiqiy sahifalar ochilmoqda..." : "Страницы готовы..."}
                                 </div>
                                 <div className="w-full h-1.5 bg-emerald-500/20 rounded-full overflow-hidden mt-1">
                                     <div className="h-full bg-emerald-400 rounded-full animate-indeterminate" />
                                 </div>
                             </div>
                         )}
-
-                        {/* Helpful Footnote */}
-                        <p className="text-[11px] text-gray-400/80 mt-4 leading-relaxed">
-                            {language === "uz"
-                                ? "Kitob bir marta yuklanadi va keshga saqlanadi. Keyingi safar darhol ochiladi!"
-                                : "Книга скачивается один раз и сохраняется в кэш. В следующий раз откроется мгновенно!"}
-                        </p>
                     </div>
                 )}
 
@@ -1465,7 +1446,7 @@ export function BookCanvasReader({
                             <AlertCircle size={28} />
                         </div>
                         <h3 className="text-base font-bold text-white mb-2">
-                            {language === "uz" ? "Yuklab olishda xatolik" : "Ошибка загрузки"}
+                            {language === "uz" ? "Kitobni ochishda xatolik" : "Ошибка открытия"}
                         </h3>
                         <p className="text-xs text-red-300 leading-relaxed mb-6">
                             {errorMessage || (language === "uz" ? "Noma'lum xatolik" : "Неизвестная ошибка")}
@@ -1488,10 +1469,10 @@ export function BookCanvasReader({
                     </div>
                 )}
 
-                {/* 3. READY STATE: REALISTIC TWO-PAGE BOOK SPREAD OR SINGLE PAGE */}
+                {/* 3. READY STATE: TRUE 3D BOOK SPREAD OR SINGLE PAGE */}
                 {status === "ready" && (
                     <div
-                        className="relative my-auto flex flex-col items-center justify-center transition-transform select-none"
+                        className="relative my-auto flex flex-col items-center justify-center transition-transform select-none book-scene"
                         style={{
                             transform: pinchVisualScale !== 1.0 ? `scale(${pinchVisualScale})` : undefined,
                             transformOrigin: "center center",
@@ -1499,11 +1480,11 @@ export function BookCanvasReader({
                         }}
                     >
                         {/* Rendering Spinner Overlay during page transitions */}
-                        {isPageRendering && (
-                            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/20 backdrop-blur-[1px] rounded-lg transition-opacity pointer-events-none">
-                                <div className="p-3 rounded-2xl bg-black/80 text-emerald-400 flex items-center gap-2.5 text-xs font-semibold shadow-2xl border border-white/10">
-                                    <Loader2 size={16} className="animate-spin text-emerald-400" />
-                                    <span>{language === "uz" ? "Sahifa ochilmoqda..." : "Листание страницы..."}</span>
+                        {isPageRendering && !isFlipping && (
+                            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/15 backdrop-blur-[1px] rounded-lg pointer-events-none">
+                                <div className="p-2.5 rounded-2xl bg-black/80 text-emerald-400 flex items-center gap-2 text-xs font-semibold shadow-2xl border border-white/10">
+                                    <Loader2 size={15} className="animate-spin text-emerald-400" />
+                                    <span>{language === "uz" ? "Sahifa yangilanmoqda..." : "Загрузка..."}</span>
                                 </div>
                             </div>
                         )}
@@ -1522,9 +1503,8 @@ export function BookCanvasReader({
                         {/* =================================================== */}
                         {effectiveIsDouble ? (
                             <div
-                                className="relative flex items-center justify-center rounded-sm transition-all"
+                                className="relative flex items-center justify-center rounded-sm book-scene"
                                 style={{
-                                    perspective: "2500px",
                                     transformStyle: "preserve-3d",
                                 }}
                             >
@@ -1535,7 +1515,9 @@ export function BookCanvasReader({
                                         background:
                                             paperTheme === "night"
                                                 ? "linear-gradient(145deg, #1A1A22, #0E0F14)"
-                                                : "linear-gradient(145deg, #241D17, #13100D)",
+                                                : paperTheme === "sepia"
+                                                    ? "linear-gradient(145deg, #2A2016, #15110B)"
+                                                    : "linear-gradient(145deg, #242426, #141416)",
                                         boxShadow:
                                             "0 25px 60px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(255,255,255,0.06), 0 10px 20px rgba(0,0,0,0.5)",
                                     }}
@@ -1543,34 +1525,37 @@ export function BookCanvasReader({
 
                                 {/* Realistic Center Spine Crease Overlay */}
                                 <div
-                                    className="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-8 sm:w-10 z-20 pointer-events-none"
+                                    className="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-8 sm:w-10 z-30 pointer-events-none"
                                     style={{
                                         background:
-                                            "linear-gradient(to right, transparent, rgba(0,0,0,0.15) 46%, rgba(0,0,0,0.32) 50%, rgba(0,0,0,0.15) 54%, transparent)",
+                                            paperTheme === "sepia"
+                                                ? "linear-gradient(to right, transparent, rgba(50,32,16,0.18) 46%, rgba(35,22,10,0.4) 50%, rgba(50,32,16,0.18) 54%, transparent)"
+                                                : "linear-gradient(to right, transparent, rgba(0,0,0,0.15) 46%, rgba(0,0,0,0.32) 50%, rgba(0,0,0,0.15) 54%, transparent)",
                                     }}
                                 />
 
                                 {/* ------------------------------------------------ */}
-                                {/* LEFT PAGE (Even page or Inside Front Cover)       */}
+                                {/* LEFT WING (Even page or Inside Front Cover)       */}
                                 {/* ------------------------------------------------ */}
                                 <div
-                                    className={`relative flex items-center justify-center overflow-hidden transition-all duration-300 ${
-                                        flipDirection === "prev" && isFlipping ? "anim-flip-prev z-30" : "z-10"
-                                    }`}
+                                    className="relative flex items-center justify-center overflow-hidden z-10"
                                     style={{
                                         filter: getThemePaperFilter(),
-                                        // Stacked paper edge effect on left
+                                        backgroundColor: getThemePaperBgColor(),
                                         boxShadow:
                                             paperTheme === "night"
                                                 ? "-3px 0 0 -1px #1E1E26, -6px 0 0 -2px #181820, -9px 0 0 -3px #121218, -16px 12px 35px rgba(0,0,0,0.7)"
-                                                : "-3px 0 0 -1px #E5DFD3, -6px 0 0 -2px #D8D1C4, -9px 0 0 -3px #CAC3B4, -16px 12px 35px rgba(0,0,0,0.6)",
+                                                : paperTheme === "sepia"
+                                                    ? "-3px 0 0 -1px #E7DEC8, -6px 0 0 -2px #DDD1BA, -9px 0 0 -3px #CFC2A7, -16px 12px 35px rgba(0,0,0,0.65)"
+                                                    : "-3px 0 0 -1px #E5DFD3, -6px 0 0 -2px #D8D1C4, -9px 0 0 -3px #CAC3B4, -16px 12px 35px rgba(0,0,0,0.6)",
                                     }}
                                 >
                                     {leftPageNum ? (
                                         <>
                                             <canvas
                                                 ref={leftCanvasRef}
-                                                className="bg-white block"
+                                                className="block"
+                                                style={{ backgroundColor: getThemePaperBgColor() }}
                                             />
                                             {/* Spine inner shadow for left page */}
                                             <div
@@ -1581,7 +1566,7 @@ export function BookCanvasReader({
                                                 }}
                                             />
                                             {/* Left Page Number Badge */}
-                                            <div className="absolute bottom-2 left-4 text-[11px] font-semibold text-gray-500/80 pointer-events-none">
+                                            <div className="absolute bottom-2 left-4 text-[11px] font-semibold text-gray-600/90 pointer-events-none">
                                                 {leftPageNum}
                                             </div>
                                         </>
@@ -1595,11 +1580,12 @@ export function BookCanvasReader({
                                                 background:
                                                     paperTheme === "night"
                                                         ? "radial-gradient(circle at 70% 30%, #1c1d28 0%, #12131b 100%)"
-                                                        : "radial-gradient(circle at 70% 30%, #1E2D22 0%, #121C15 100%)",
+                                                        : paperTheme === "sepia"
+                                                            ? "radial-gradient(circle at 70% 30%, #2A2016 0%, #17120C 100%)"
+                                                            : "radial-gradient(circle at 70% 30%, #1E2D22 0%, #121C15 100%)",
                                                 borderRight: "1px solid rgba(0,0,0,0.4)",
                                             }}
                                         >
-                                            {/* Decorative Vintage Border */}
                                             <div className="w-full h-full border border-emerald-500/30 rounded-lg p-5 flex flex-col items-center justify-between relative shadow-inner">
                                                 <div className="flex items-center gap-2 text-emerald-400 text-xs font-semibold tracking-wider uppercase">
                                                     <Sparkles size={14} />
@@ -1618,54 +1604,139 @@ export function BookCanvasReader({
                                                             <BookOpen size={32} className="text-emerald-400" />
                                                         )}
                                                     </div>
-                                                    <h3 className="text-base sm:lg font-bold text-white line-clamp-2">
+                                                    <h3 className="text-base sm:text-lg font-bold text-white line-clamp-2">
                                                         {bookTitle}
                                                     </h3>
                                                     <p className="text-[11px] sm:text-xs text-emerald-300/80 mt-2">
-                                                        {language === "uz" ? "Mualliflik nusxasi • To'liq kitob" : "Электронное издание книги"}
+                                                        {language === "uz" ? "Mualliflik nashri • To'liq kitob" : "Электронное издание книги"}
                                                     </p>
                                                 </div>
 
                                                 <div className="text-[10px] sm:text-[11px] text-gray-400 font-medium">
                                                     {language === "uz"
-                                                        ? "O'ng tomonda 1-sahifa (Muqova). Mutolaani boshlash uchun o'ng tomonga bosing →"
-                                                        : "Справа страница 1 (Обложка). Нажмите для чтения →"}
+                                                        ? "O'ng tomonda 1-sahifa (Muqova). Varaqlash uchun pastdagi tugmani bosing →"
+                                                        : "Справа 1-я страница. Нажмите Далее для чтения →"}
                                                 </div>
                                             </div>
+                                        </div>
+                                    )}
 
-                                            {/* Spine crease inner shadow */}
+                                    {/* PREV FLIP LEAF (turning from Left to Right) */}
+                                    {isFlipping && flipState?.direction === "prev" && (
+                                        <div className="book-leaf anim-flip-leaf-prev z-40">
+                                            {/* Front Face: Current Left Page */}
                                             <div
-                                                className="absolute top-0 right-0 bottom-0 w-12 pointer-events-none"
+                                                className="leaf-face"
                                                 style={{
-                                                    background:
-                                                        "linear-gradient(to left, rgba(0,0,0,0.25) 0%, transparent 100%)",
+                                                    backgroundColor: getThemePaperBgColor(),
                                                 }}
-                                            />
+                                            >
+                                                {flipState.frontSnapshot ? (
+                                                    <img
+                                                        src={flipState.frontSnapshot}
+                                                        alt=""
+                                                        className="w-full h-full object-cover"
+                                                    />
+                                                ) : (
+                                                    <div className="w-full h-full flex items-center justify-center text-gray-500 font-bold text-sm">
+                                                        {leftPageNum || 1}
+                                                    </div>
+                                                )}
+                                                {/* Turning page dynamic shadow */}
+                                                <div
+                                                    className="absolute inset-0 pointer-events-none"
+                                                    style={{
+                                                        background:
+                                                            "linear-gradient(to left, rgba(0,0,0,0.3) 0%, rgba(0,0,0,0.08) 40%, transparent 100%)",
+                                                    }}
+                                                />
+                                            </div>
+
+                                            {/* Back Face: Previous Right Page */}
+                                            <div
+                                                className="leaf-face leaf-back"
+                                                style={{
+                                                    backgroundColor: getThemePaperBgColor(),
+                                                }}
+                                            >
+                                                {flipState.backSnapshot ? (
+                                                    <img
+                                                        src={flipState.backSnapshot}
+                                                        alt=""
+                                                        className="w-full h-full object-cover"
+                                                    />
+                                                ) : (
+                                                    <div className="w-full h-full flex items-center justify-center text-gray-600 font-bold text-sm">
+                                                        {flipState.backPageNum || ""}
+                                                    </div>
+                                                )}
+                                                <div
+                                                    className="absolute inset-0 pointer-events-none"
+                                                    style={{
+                                                        background:
+                                                            "linear-gradient(to right, rgba(0,0,0,0.25) 0%, transparent 60%)",
+                                                    }}
+                                                />
+                                            </div>
                                         </div>
                                     )}
                                 </div>
 
                                 {/* ------------------------------------------------ */}
-                                {/* RIGHT PAGE (Odd page or Inside Back Cover)        */}
+                                {/* RIGHT WING (Odd page or Inside Back Cover)       */}
                                 {/* ------------------------------------------------ */}
                                 <div
-                                    className={`relative flex items-center justify-center overflow-hidden transition-all duration-300 ${
-                                        flipDirection === "next" && isFlipping ? "anim-flip-next z-30" : "z-10"
-                                    }`}
+                                    className="relative flex items-center justify-center overflow-hidden z-10"
                                     style={{
                                         filter: getThemePaperFilter(),
-                                        // Stacked paper edge effect on right
+                                        backgroundColor: getThemePaperBgColor(),
                                         boxShadow:
                                             paperTheme === "night"
                                                 ? "3px 0 0 -1px #1E1E26, 6px 0 0 -2px #181820, 9px 0 0 -3px #121218, 16px 12px 35px rgba(0,0,0,0.7)"
-                                                : "3px 0 0 -1px #E5DFD3, 6px 0 0 -2px #D8D1C4, 9px 0 0 -3px #CAC3B4, 16px 12px 35px rgba(0,0,0,0.6)",
+                                                : paperTheme === "sepia"
+                                                    ? "3px 0 0 -1px #E7DEC8, 6px 0 0 -2px #DDD1BA, 9px 0 0 -3px #CFC2A7, 16px 12px 35px rgba(0,0,0,0.65)"
+                                                    : "3px 0 0 -1px #E5DFD3, 6px 0 0 -2px #D8D1C4, 9px 0 0 -3px #CAC3B4, 16px 12px 35px rgba(0,0,0,0.6)",
                                     }}
                                 >
+                                    {/* UNDERLYING NEXT PAGE (Eliminates the black gap during next flip!) */}
+                                    {isFlipping && flipState?.direction === "next" && (
+                                        <div
+                                            className="absolute inset-0 z-0 flex items-center justify-center"
+                                            style={{
+                                                backgroundColor: getThemePaperBgColor(),
+                                            }}
+                                        >
+                                            {flipState.underlyingSnapshot ? (
+                                                <img
+                                                    src={flipState.underlyingSnapshot}
+                                                    alt=""
+                                                    className="w-full h-full object-cover"
+                                                />
+                                            ) : (
+                                                <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center text-gray-500">
+                                                    <span className="text-xs font-bold uppercase tracking-wider text-gray-400">
+                                                        {language === "uz" ? "Sahifa" : "Страница"} {flipState.underlyingPageNum}
+                                                    </span>
+                                                </div>
+                                            )}
+                                            {/* Shadow on underlying page from lifting leaf */}
+                                            <div
+                                                className="absolute inset-0 pointer-events-none"
+                                                style={{
+                                                    background:
+                                                        "linear-gradient(to right, rgba(0,0,0,0.25) 0%, rgba(0,0,0,0.06) 30%, transparent 100%)",
+                                                }}
+                                            />
+                                        </div>
+                                    )}
+
+                                    {/* Main Right Page Canvas */}
                                     {rightPageNum ? (
                                         <>
                                             <canvas
                                                 ref={rightCanvasRef}
-                                                className="bg-white block"
+                                                className="block"
+                                                style={{ backgroundColor: getThemePaperBgColor() }}
                                             />
                                             {/* Spine inner shadow for right page */}
                                             <div
@@ -1676,7 +1747,7 @@ export function BookCanvasReader({
                                                 }}
                                             />
                                             {/* Right Page Number Badge */}
-                                            <div className="absolute bottom-2 right-4 text-[11px] font-semibold text-gray-500/80 pointer-events-none">
+                                            <div className="absolute bottom-2 right-4 text-[11px] font-semibold text-gray-600/90 pointer-events-none">
                                                 {rightPageNum}
                                             </div>
                                         </>
@@ -1690,7 +1761,9 @@ export function BookCanvasReader({
                                                 background:
                                                     paperTheme === "night"
                                                         ? "radial-gradient(circle at 30% 30%, #1c1d28 0%, #12131b 100%)"
-                                                        : "radial-gradient(circle at 30% 30%, #1E2D22 0%, #121C15 100%)",
+                                                        : paperTheme === "sepia"
+                                                            ? "radial-gradient(circle at 30% 30%, #2A2016 0%, #17120C 100%)"
+                                                            : "radial-gradient(circle at 30% 30%, #1E2D22 0%, #121C15 100%)",
                                                 borderLeft: "1px solid rgba(0,0,0,0.4)",
                                             }}
                                         >
@@ -1709,53 +1782,133 @@ export function BookCanvasReader({
                                                         if (isSoundEnabled) paperSound.play();
                                                         setCurrentPage(1);
                                                     }}
-                                                    className="py-2 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold active:scale-95 transition-all shadow-lg shadow-emerald-900/30"
+                                                    className="py-2.5 px-5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold active:scale-95 transition-all shadow-lg shadow-emerald-900/30"
                                                 >
                                                     {language === "uz" ? "Boshiga qaytish (1-sahifa)" : "В начало (Стр. 1)"}
                                                 </button>
                                             </div>
+                                        </div>
+                                    )}
 
-                                            {/* Spine crease inner shadow */}
+                                    {/* NEXT FLIP LEAF (turning from Right to Left) */}
+                                    {isFlipping && flipState?.direction === "next" && (
+                                        <div className="book-leaf anim-flip-leaf-next z-40">
+                                            {/* Front Face: Current Right Page */}
                                             <div
-                                                className="absolute top-0 left-0 bottom-0 w-12 pointer-events-none"
+                                                className="leaf-face"
                                                 style={{
-                                                    background:
-                                                        "linear-gradient(to right, rgba(0,0,0,0.25) 0%, transparent 100%)",
+                                                    backgroundColor: getThemePaperBgColor(),
                                                 }}
-                                            />
+                                            >
+                                                {flipState.frontSnapshot ? (
+                                                    <img
+                                                        src={flipState.frontSnapshot}
+                                                        alt=""
+                                                        className="w-full h-full object-cover"
+                                                    />
+                                                ) : (
+                                                    <div className="w-full h-full flex items-center justify-center text-gray-500 font-bold text-sm">
+                                                        {rightPageNum || 1}
+                                                    </div>
+                                                )}
+                                                {/* Turning gradient shadow overlay */}
+                                                <div
+                                                    className="absolute inset-0 pointer-events-none"
+                                                    style={{
+                                                        background:
+                                                            "linear-gradient(to right, rgba(0,0,0,0.3) 0%, rgba(0,0,0,0.08) 40%, transparent 100%)",
+                                                    }}
+                                                />
+                                            </div>
+
+                                            {/* Back Face: Upcoming Left Page */}
+                                            <div
+                                                className="leaf-face leaf-back"
+                                                style={{
+                                                    backgroundColor: getThemePaperBgColor(),
+                                                }}
+                                            >
+                                                {flipState.backSnapshot ? (
+                                                    <img
+                                                        src={flipState.backSnapshot}
+                                                        alt=""
+                                                        className="w-full h-full object-cover"
+                                                    />
+                                                ) : (
+                                                    <div className="w-full h-full flex items-center justify-center text-gray-600 font-bold text-sm">
+                                                        {flipState.backPageNum || ""}
+                                                    </div>
+                                                )}
+                                                <div
+                                                    className="absolute inset-0 pointer-events-none"
+                                                    style={{
+                                                        background:
+                                                            "linear-gradient(to left, rgba(0,0,0,0.25) 0%, transparent 60%)",
+                                                    }}
+                                                />
+                                            </div>
                                         </div>
                                     )}
                                 </div>
                             </div>
                         ) : (
                             /* =================================================== */
-                            /* B. SINGLE PAGE VIEW (Mobile / Tablet or User Pick)  */
+                            /* B. SINGLE PAGE VIEW (Mobile / Tablet or Picked)     */
                             /* =================================================== */
                             <div
-                                className={`relative flex items-center justify-center rounded-sm transition-all ${
-                                    isFlipping
-                                        ? flipDirection === "next"
-                                            ? "anim-flip-next"
-                                            : "anim-flip-prev"
-                                        : ""
-                                }`}
+                                className="relative flex items-center justify-center rounded-sm transition-all book-scene"
                                 style={{
                                     filter: getThemePaperFilter(),
-                                    // Stacked paper depth shadow for single sheet
+                                    backgroundColor: getThemePaperBgColor(),
                                     boxShadow:
                                         paperTheme === "night"
                                             ? "0 20px 50px rgba(0,0,0,0.8), -3px 0 0 -1px #1E1E26, 3px 0 0 -1px #1E1E26"
-                                            : "0 20px 50px rgba(0,0,0,0.65), -3px 0 0 -1px #E5DFD3, 3px 0 0 -1px #E5DFD3",
+                                            : paperTheme === "sepia"
+                                                ? "0 20px 50px rgba(0,0,0,0.7), -3px 0 0 -1px #E7DEC8, 3px 0 0 -1px #E7DEC8"
+                                                : "0 20px 50px rgba(0,0,0,0.65), -3px 0 0 -1px #E5DFD3, 3px 0 0 -1px #E5DFD3",
                                 }}
                             >
-                                <canvas
-                                    ref={singleCanvasRef}
-                                    className="bg-white block rounded-sm"
-                                />
+                                {/* Underlying Next Page during single flip (No Black Gap!) */}
+                                {isFlipping && (
+                                    <div
+                                        className="absolute inset-0 z-0 flex items-center justify-center"
+                                        style={{ backgroundColor: getThemePaperBgColor() }}
+                                    >
+                                        {flipState?.underlyingSnapshot ? (
+                                            <img
+                                                src={flipState.underlyingSnapshot}
+                                                alt=""
+                                                className="w-full h-full object-cover rounded-sm"
+                                            />
+                                        ) : (
+                                            <div className="w-full h-full flex items-center justify-center text-gray-500 font-bold text-sm">
+                                                {flipState?.underlyingPageNum}
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
 
-                                {/* Single Page Number Badge */}
-                                <div className="absolute bottom-2 right-4 text-[11px] font-semibold text-gray-500/80 pointer-events-none">
-                                    {currentPage}
+                                <div
+                                    className={`relative z-10 ${
+                                        isFlipping
+                                            ? flipState?.direction === "next"
+                                                ? "anim-flip-leaf-next"
+                                                : "anim-flip-leaf-prev"
+                                            : ""
+                                    }`}
+                                    style={{
+                                        transformStyle: "preserve-3d",
+                                        backgroundColor: getThemePaperBgColor(),
+                                    }}
+                                >
+                                    <canvas
+                                        ref={singleCanvasRef}
+                                        className="block rounded-sm"
+                                        style={{ backgroundColor: getThemePaperBgColor() }}
+                                    />
+                                    <div className="absolute bottom-2 right-4 text-[11px] font-semibold text-gray-600/90 pointer-events-none">
+                                        {currentPage}
+                                    </div>
                                 </div>
                             </div>
                         )}
@@ -1764,42 +1917,141 @@ export function BookCanvasReader({
             </main>
 
             {/* =============================================================== */}
-            {/* BOTTOM BAR: LARGE TOUCH BUTTONS & SPREAD NAVIGATION */}
+            {/* 4. FLOATING RESPONSIVE BOTTOM CONTROL DOCK (40-44px Touch Targets) */}
             {/* =============================================================== */}
             {status === "ready" && totalPages > 0 && (
-                <footer className="h-16 sm:h-14 bg-[#161E17]/95 backdrop-blur-md border-t border-white/10 px-4 flex items-center justify-between gap-3 shrink-0 shadow-2xl z-30">
-                    {/* Previous Page Button */}
-                    <button
-                        onClick={goToPrevPage}
-                        disabled={currentPage <= 1 || isFlipping}
-                        className="flex-1 sm:flex-initial py-2.5 px-4 sm:px-6 rounded-xl bg-white/10 hover:bg-white/15 active:scale-95 text-white disabled:opacity-30 disabled:hover:bg-white/10 text-xs sm:text-sm font-bold flex items-center justify-center gap-1.5 transition-all"
-                        aria-label="Oldingi sahifa"
+                <div className="fixed bottom-3 sm:bottom-5 left-1/2 -translate-x-1/2 z-50 w-[94vw] max-w-fit pointer-events-auto">
+                    <nav
+                        aria-label="Book Reader Navigation"
+                        className="bg-[#181512]/95 backdrop-blur-xl border border-white/15 px-2.5 sm:px-4 py-2 rounded-2xl sm:rounded-full shadow-2xl flex flex-wrap items-center justify-center gap-1.5 sm:gap-3"
                     >
-                        <ChevronLeft size={18} strokeWidth={2.5} />
-                        <span>{language === "uz" ? "Oldingi" : "Назад"}</span>
-                    </button>
+                        {/* 1. Page Turn: PREVIOUS */}
+                        <button
+                            onClick={goToPrevPage}
+                            disabled={currentPage <= 1 || isFlipping}
+                            className="h-11 px-3 sm:px-4 rounded-xl sm:rounded-full bg-white/10 hover:bg-white/15 active:scale-95 text-white disabled:opacity-25 disabled:hover:bg-white/10 text-xs sm:text-sm font-bold flex items-center justify-center gap-1 transition-all shrink-0 shadow-sm"
+                            title={language === "uz" ? "Oldingi sahifa (ArrowLeft)" : "Предыдущая (ArrowLeft)"}
+                            aria-label="Previous Page"
+                        >
+                            <ChevronLeft size={18} strokeWidth={2.5} />
+                            <span className="hidden xs:inline">{language === "uz" ? "Oldingi" : "Назад"}</span>
+                        </button>
 
-                    {/* Page Indicator Badge */}
-                    <div className="text-center shrink-0 px-2">
-                        <span className="text-xs sm:text-sm font-bold text-white tracking-wide">
-                            {getPageDisplayLabel()}
-                        </span>
-                        <div className="text-[10px] text-gray-400 block sm:hidden">
-                            {language === "uz" ? "2 marta bosing: harflarni kattalashtirish" : "Дважды нажмите: увеличение"}
+                        {/* 2. Page Counter with Direct Jump Input */}
+                        <form
+                            onSubmit={handlePageInputSubmit}
+                            className="h-11 flex items-center gap-1 bg-black/45 border border-white/15 rounded-xl sm:rounded-full px-2.5 sm:px-3.5 shadow-inner shrink-0"
+                            title={language === "uz" ? "Sahifa raqamini yozib Enter bosing" : "Введите номер страницы"}
+                        >
+                            <span className="text-[11px] text-gray-400 font-medium hidden sm:inline">
+                                {language === "uz" ? "Sahifa:" : "Стр:"}
+                            </span>
+                            <input
+                                type="text"
+                                inputMode="numeric"
+                                pattern="[0-9]*"
+                                value={pageInputValue}
+                                onChange={(e) => setPageInputValue(e.target.value)}
+                                onBlur={handlePageInputSubmit}
+                                className="w-8 sm:w-12 text-center bg-transparent border-0 text-xs sm:text-sm font-extrabold text-white focus:outline-none focus:ring-0"
+                                aria-label="Current page number"
+                            />
+                            <span className="text-gray-400 text-xs font-semibold">/</span>
+                            <span className="text-gray-200 text-xs sm:text-sm font-bold">{totalPages}</span>
+                        </form>
+
+                        {/* 3. Page Turn: NEXT */}
+                        <button
+                            onClick={goToNextPage}
+                            disabled={currentPage >= totalPages || isFlipping}
+                            className="h-11 px-3 sm:px-4 rounded-xl sm:rounded-full bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white disabled:opacity-25 disabled:hover:bg-emerald-600 text-xs sm:text-sm font-bold flex items-center justify-center gap-1 transition-all shrink-0 shadow-lg shadow-emerald-900/30"
+                            title={language === "uz" ? "Keyingi sahifa (ArrowRight)" : "Следующая (ArrowRight)"}
+                            aria-label="Next Page"
+                        >
+                            <span className="hidden xs:inline">{language === "uz" ? "Keyingi" : "Вперед"}</span>
+                            <ChevronRight size={18} strokeWidth={2.5} />
+                        </button>
+
+                        {/* Divider */}
+                        <div className="h-6 w-px bg-white/15 hidden md:block shrink-0" />
+
+                        {/* 4. Zoom Group: [ - ] [ 100% / Fit ] [ + ] */}
+                        <div className="h-11 flex items-center gap-0.5 bg-black/45 border border-white/15 rounded-xl sm:rounded-full p-1 shadow-inner shrink-0">
+                            <button
+                                onClick={handleZoomOut}
+                                className="h-9 w-9 rounded-lg sm:rounded-full text-gray-300 hover:text-white hover:bg-white/10 active:scale-95 flex items-center justify-center transition-colors"
+                                title={language === "uz" ? "Kichraytirish (-)" : "Уменьшить (-)"}
+                                aria-label="Zoom Out"
+                            >
+                                <ZoomOut size={16} />
+                            </button>
+                            <button
+                                onClick={handleToggleFitWidth}
+                                className={`h-9 px-2.5 rounded-lg sm:rounded-full text-xs font-bold transition-all ${
+                                    isFitWidth
+                                        ? "bg-emerald-600 text-white shadow-xs"
+                                        : zoom > 1.15
+                                            ? "bg-emerald-500/25 text-emerald-300 font-extrabold"
+                                            : "text-gray-300 hover:text-white"
+                                }`}
+                                title={language === "uz" ? "Kenglikka moslash / 100% ga qaytarish" : "По ширине / Масштаб"}
+                            >
+                                {isFitWidth ? (language === "uz" ? "Kenglik" : "Ширина") : `${Math.round(zoom * 100)}%`}
+                            </button>
+                            <button
+                                onClick={handleZoomIn}
+                                className="h-9 w-9 rounded-lg sm:rounded-full text-gray-300 hover:text-white hover:bg-white/10 active:scale-95 flex items-center justify-center transition-colors"
+                                title={language === "uz" ? "Kattalashtirish (+)" : "Увеличить (+)"}
+                                aria-label="Zoom In"
+                            >
+                                <ZoomIn size={16} />
+                            </button>
                         </div>
-                    </div>
 
-                    {/* Next Page Button */}
-                    <button
-                        onClick={goToNextPage}
-                        disabled={currentPage >= totalPages || isFlipping}
-                        className="flex-1 sm:flex-initial py-2.5 px-4 sm:px-6 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white disabled:opacity-30 disabled:hover:bg-emerald-600 text-xs sm:text-sm font-bold flex items-center justify-center gap-1.5 transition-all shadow-lg shadow-emerald-900/30"
-                        aria-label="Keyingi sahifa"
-                    >
-                        <span>{language === "uz" ? "Keyingi" : "Вперед"}</span>
-                        <ChevronRight size={18} strokeWidth={2.5} />
-                    </button>
-                </footer>
+                        {/* 5. View Mode: [ 📖 Kitob / 📄 Sahifa ] */}
+                        {!isNarrowScreen && (
+                            <button
+                                onClick={toggleViewMode}
+                                className="h-11 px-3 rounded-xl sm:rounded-full bg-white/10 hover:bg-white/15 border border-white/10 text-gray-200 hover:text-white text-xs font-semibold hidden md:flex items-center gap-1.5 active:scale-95 transition-all shrink-0"
+                                title={
+                                    viewMode === "double"
+                                        ? language === "uz" ? "Yakka sahifa rejimiga o'tish" : "В одну страницу"
+                                        : language === "uz" ? "Kitob ko'rinishiga (2 sahifa) o'tish" : "Разворот книги"
+                                }
+                            >
+                                {viewMode === "double" ? (
+                                    <>
+                                        <Book size={16} className="text-emerald-400" />
+                                        <span className="hidden lg:inline">{language === "uz" ? "Kitob (2 bet)" : "Разворот"}</span>
+                                    </>
+                                ) : (
+                                    <>
+                                        <FileText size={16} className="text-blue-400" />
+                                        <span className="hidden lg:inline">{language === "uz" ? "Yakka bet" : "1 страница"}</span>
+                                    </>
+                                )}
+                            </button>
+                        )}
+
+                        {/* 6. Sound Toggle: [ 🔊 / 🔇 ] */}
+                        <button
+                            onClick={toggleSound}
+                            className={`h-11 w-11 rounded-xl sm:rounded-full border active:scale-95 flex items-center justify-center transition-all shrink-0 ${
+                                isSoundEnabled
+                                    ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/35"
+                                    : "bg-white/10 text-gray-400 hover:text-white border-white/10"
+                            }`}
+                            title={
+                                isSoundEnabled
+                                    ? language === "uz" ? "Varaqlash tovushi: Yoqiq" : "Звук страниц: Вкл"
+                                    : language === "uz" ? "Varaqlash tovushi: O'chiq" : "Звук страниц: Выкл"
+                            }
+                            aria-label="Toggle Sound"
+                        >
+                            {isSoundEnabled ? <Volume2 size={17} /> : <VolumeX size={17} />}
+                        </button>
+                    </nav>
+                </div>
             )}
         </div>
     );
