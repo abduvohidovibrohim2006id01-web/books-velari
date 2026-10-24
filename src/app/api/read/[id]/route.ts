@@ -4,6 +4,41 @@ import { getProductIdFromSlug } from "@/lib/slugify";
 // In-memory cache for resolved PDF filenames (24 hours TTL)
 const FILE_CACHE = new Map<string, { fileName: string; expires: number }>();
 
+// In-memory cache for dynamic Telegram Stream Bridge URL (60 seconds TTL)
+let cachedBridgeUrl: { url: string; expires: number } | null = null;
+
+async function getBridgeUrl(): Promise<string> {
+    const now = Date.now();
+    if (cachedBridgeUrl && cachedBridgeUrl.expires > now) {
+        return cachedBridgeUrl.url;
+    }
+
+    if (process.env.TELEGRAM_BRIDGE_URL) {
+        cachedBridgeUrl = { url: process.env.TELEGRAM_BRIDGE_URL, expires: now + 300000 };
+        return process.env.TELEGRAM_BRIDGE_URL;
+    }
+
+    try {
+        const { data } = await supabaseAdmin
+            .from("site_settings")
+            .select("value")
+            .eq("key", "telegram_bridge")
+            .maybeSingle();
+
+        if (data?.value?.url && data?.value?.active) {
+            cachedBridgeUrl = { url: data.value.url, expires: now + 60000 };
+            return data.value.url;
+        }
+    } catch (e) {
+        console.error("[api/read] Failed to fetch telegram_bridge from site_settings:", e);
+    }
+
+    // Default fallback tunnel URL
+    const fallback = "https://queensland-varies-continues-identification.trycloudflare.com";
+    cachedBridgeUrl = { url: fallback, expires: now + 60000 };
+    return fallback;
+}
+
 export const dynamic = "force-dynamic";
 
 export async function GET(
@@ -22,6 +57,7 @@ export async function GET(
 
         let archiveIdentifier: string | null = null;
         let fileName: string | null = null;
+        let hasDirectArchiveFile = false;
 
         // 1. Supabase'dan mahsulotni topish
         try {
@@ -43,10 +79,11 @@ export async function GET(
                         } catch {
                             fileName = directFileMatch[2];
                         }
+                        hasDirectArchiveFile = true;
                     }
                 }
 
-                // Agar to'g'ridan-to'g'ri fayl manzili topilmagan bo'lsa, standart identifikatordan aniqlash
+                // Standart identifikatordan aniqlash
                 if (!archiveIdentifier) {
                     if (product.archive_identifier) {
                         archiveIdentifier = product.archive_identifier;
@@ -62,113 +99,131 @@ export async function GET(
             console.error("[api/read] Supabase query error:", dbErr);
         }
 
-        // Agar DB dan topilmasa, cleanId yoki rawId ning o'zi bevosita archive_identifier bo'lishi mumkin
-        if (!archiveIdentifier) {
-            if (/^[a-zA-Z0-9_\-\.]{3,120}$/.test(cleanId)) {
-                archiveIdentifier = cleanId;
-            } else if (/^[a-zA-Z0-9_\-\.]{3,120}$/.test(rawId)) {
-                archiveIdentifier = rawId;
+        // 2. Agar Archive.org ma'lumotlari mavjud bo'lsa, avval Archive.org dan olishga urinamiz
+        if (archiveIdentifier) {
+            try {
+                if (!fileName) {
+                    const now = Date.now();
+                    const cached = FILE_CACHE.get(archiveIdentifier);
+
+                    if (cached && cached.expires > now) {
+                        fileName = cached.fileName;
+                    } else {
+                        const metaRes = await fetch(`https://archive.org/metadata/${encodeURIComponent(archiveIdentifier)}`, {
+                            headers: {
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
+                                "Accept": "application/json",
+                            },
+                            next: { revalidate: 86400 }
+                        });
+
+                        if (metaRes.ok) {
+                            const metaData = await metaRes.json();
+                            const files: any[] = Array.isArray(metaData?.files) ? metaData.files : [];
+                            const pdfFiles = files.filter((f: any) => {
+                                const name = (f.name || "").toLowerCase();
+                                const format = (f.format || "").toLowerCase();
+                                return (format.includes("pdf") || name.endsWith(".pdf")) && !name.endsWith(".xml") && !name.endsWith(".sqlite");
+                            });
+
+                            const selected = pdfFiles.find((f: any) => f.format === "Text PDF")
+                                || pdfFiles.find((f: any) => f.source === "original" && f.name?.toLowerCase().endsWith(".pdf"))
+                                || pdfFiles[0];
+
+                            if (selected && selected.name) {
+                                fileName = String(selected.name);
+                                FILE_CACHE.set(archiveIdentifier, {
+                                    fileName: fileName,
+                                    expires: now + 24 * 60 * 60 * 1000
+                                });
+                            }
+                        }
+                    }
+                }
+
+                if (fileName) {
+                    const downloadUrl = `https://archive.org/download/${archiveIdentifier}/${encodeURIComponent(fileName)}`;
+                    const fetchHeaders: Record<string, string> = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Accept": "application/pdf,*/*",
+                    };
+
+                    const rangeHeader = request.headers.get("range");
+                    if (rangeHeader) {
+                        fetchHeaders["Range"] = rangeHeader;
+                    }
+
+                    const archiveRes = await fetch(downloadUrl, {
+                        headers: fetchHeaders,
+                        redirect: "follow",
+                    });
+
+                    if (archiveRes.ok || archiveRes.status === 206) {
+                        const responseHeaders = new Headers();
+                        responseHeaders.set("Content-Type", "application/pdf");
+                        responseHeaders.set("Content-Disposition", 'inline; filename="book.pdf"');
+                        responseHeaders.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
+                        responseHeaders.set("X-Content-Type-Options", "nosniff");
+                        responseHeaders.set("Accept-Ranges", "bytes");
+
+                        const contentLength = archiveRes.headers.get("content-length");
+                        if (contentLength) responseHeaders.set("Content-Length", contentLength);
+                        const contentRange = archiveRes.headers.get("content-range");
+                        if (contentRange) responseHeaders.set("Content-Range", contentRange);
+
+                        return new Response(archiveRes.body, {
+                            status: archiveRes.status,
+                            headers: responseHeaders,
+                        });
+                    }
+                }
+            } catch (archiveErr) {
+                console.warn("[api/read] Archive.org fetch failed, falling back to Telegram stream bridge:", archiveErr);
             }
         }
 
-        if (!archiveIdentifier) {
-            return new Response("Kitob arxiv identifikatori topilmadi", { status: 404 });
-        }
+        // 3. ON-DEMAND FALLBACK: Telegram Stream Bridge orqali lahzalik oqim
+        const bridgeBase = await getBridgeUrl();
+        const bridgeUrl = `${bridgeBase.replace(/\/+$/, "")}/stream/${encodeURIComponent(cleanId)}`;
 
-        // 2. Archive.org fayl nomini aniqlash (agar to'plamdan to'g'ridan-to'g'ri olinmagan bo'lsa)
-        if (!fileName) {
-            const now = Date.now();
-            const cached = FILE_CACHE.get(archiveIdentifier);
-
-            if (cached && cached.expires > now) {
-                fileName = cached.fileName;
-            } else {
-                const metaRes = await fetch(`https://archive.org/metadata/${encodeURIComponent(archiveIdentifier)}`, {
-                    headers: {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
-                        "Accept": "application/json",
-                    },
-                    next: { revalidate: 86400 } // 24 soat kesh
-                });
-
-                if (!metaRes.ok) {
-                    return new Response("Arxiv ma'lumotlarini yuklab bo'lmadi", { status: 404 });
-                }
-
-                const metaData = await metaRes.json();
-                const files: any[] = Array.isArray(metaData?.files) ? metaData.files : [];
-
-                const pdfFiles = files.filter((f: any) => {
-                    const name = (f.name || "").toLowerCase();
-                    const format = (f.format || "").toLowerCase();
-                    return (format.includes("pdf") || name.endsWith(".pdf")) && !name.endsWith(".xml") && !name.endsWith(".sqlite");
-                });
-
-                const selected = pdfFiles.find((f: any) => f.format === "Text PDF")
-                    || pdfFiles.find((f: any) => f.source === "original" && f.name?.toLowerCase().endsWith(".pdf"))
-                    || pdfFiles[0];
-
-                if (!selected || !selected.name) {
-                    return new Response("Kitobning PDF formati topilmadi", { status: 404 });
-                }
-
-                const resolvedName = String(selected.name);
-                fileName = resolvedName;
-                FILE_CACHE.set(archiveIdentifier, {
-                    fileName: resolvedName,
-                    expires: now + 24 * 60 * 60 * 1000 // 24 soat
-                });
-            }
-        }
-
-        if (!fileName) {
-            return new Response("Kitobning PDF formati topilmadi", { status: 404 });
-        }
-
-        // 3. Archive.org'dan PDF faylni oqim (stream) ko'rinishida olish
-        const downloadUrl = `https://archive.org/download/${archiveIdentifier}/${encodeURIComponent(fileName)}`;
-
-        const fetchHeaders: Record<string, string> = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        const bridgeHeaders: Record<string, string> = {
             "Accept": "application/pdf,*/*",
         };
-
         const rangeHeader = request.headers.get("range");
         if (rangeHeader) {
-            fetchHeaders["Range"] = rangeHeader;
+            bridgeHeaders["Range"] = rangeHeader;
         }
 
-        const archiveRes = await fetch(downloadUrl, {
-            headers: fetchHeaders,
-            redirect: "follow",
-        });
+        try {
+            const bridgeRes = await fetch(bridgeUrl, {
+                headers: bridgeHeaders,
+                redirect: "follow",
+            });
 
-        if (!archiveRes.ok && archiveRes.status !== 206) {
-            return new Response("Kitob faylini yuklab bo'lmadi", { status: archiveRes.status });
+            if (bridgeRes.ok || bridgeRes.status === 206) {
+                const responseHeaders = new Headers();
+                responseHeaders.set("Content-Type", "application/pdf");
+                responseHeaders.set("Content-Disposition", 'inline; filename="book.pdf"');
+                responseHeaders.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
+                responseHeaders.set("X-Content-Type-Options", "nosniff");
+                responseHeaders.set("Accept-Ranges", "bytes");
+
+                const contentLength = bridgeRes.headers.get("content-length");
+                if (contentLength) responseHeaders.set("Content-Length", contentLength);
+                const contentRange = bridgeRes.headers.get("content-range");
+                if (contentRange) responseHeaders.set("Content-Range", contentRange);
+
+                return new Response(bridgeRes.body, {
+                    status: bridgeRes.status,
+                    headers: responseHeaders,
+                });
+            }
+        } catch (bridgeErr) {
+            console.error("[api/read] Telegram bridge fetch error:", bridgeErr);
         }
 
-        // 4. Brauzerga xavfsiz inline sarlavhalar bilan PDF oqimini qaytarish
-        const responseHeaders = new Headers();
-        responseHeaders.set("Content-Type", "application/pdf");
-        responseHeaders.set("Content-Disposition", 'inline; filename="book.pdf"');
-        responseHeaders.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
-        responseHeaders.set("X-Content-Type-Options", "nosniff");
-        responseHeaders.set("Accept-Ranges", "bytes");
+        return new Response("Kitob fayli topilmadi yoki hali yuklanmagan", { status: 404 });
 
-        const contentLength = archiveRes.headers.get("content-length");
-        if (contentLength) {
-            responseHeaders.set("Content-Length", contentLength);
-        }
-
-        const contentRange = archiveRes.headers.get("content-range");
-        if (contentRange) {
-            responseHeaders.set("Content-Range", contentRange);
-        }
-
-        return new Response(archiveRes.body, {
-            status: archiveRes.status,
-            headers: responseHeaders,
-        });
     } catch (err: any) {
         console.error("[api/read] Unexpected error:", err);
         return new Response("Xatolik yuz berdi: " + (err?.message || "Internal Server Error"), { status: 500 });
