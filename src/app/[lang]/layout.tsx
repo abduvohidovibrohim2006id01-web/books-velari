@@ -15,14 +15,14 @@ const inter = Inter({
 
 const DEFAULT_META = {
     uz: {
-        title: "Velari | Zamonaviy Texnologiyalar va Gadjetlar Dunyosi",
-        description: "Premium gadjetlar va elektronika do'koni. Apple, Samsung, Xiaomi mahsulotlari hamyonbop narxlarda. Muddatli to'lov, rasmiy kafolat va O'zbekiston bo'ylab yetkazib berish.",
-        ogDescription: "O'zbekistondagi premium elektronika do'koni. Global brendlar, rasmiy kafolat va tez yetkazib berish. iPhone, Samsung va Xiaomi — muddatli to'lovga.",
+        title: "Velari Kutubxona | Ochiq Elektron Kutubxona va Bepul Mutolaa",
+        description: "150,000+ o'zbek va jahon adabiyoti durdonalari, darsliklar, badiiy va biznes kitoblari. Zamonaviy 3D flipbook formatida bepul onlayn mutolaa qiling.",
+        ogDescription: "O'zbekistonning eng katta ochiq elektron kutubxonasi. 150,000+ kitoblar, 3D mutolaa va oflayn kesh tizimi bilan 100% bepul.",
     },
     ru: {
-        title: "Velari | Мир современных технологий и гаджетов",
-        description: "Магазин премиальных гаджетов и электроники. Apple, Samsung, Xiaomi по доступным ценам. Рассрочка, официальная гарантия и доставка по всему Узбекистану.",
-        ogDescription: "Премиальный магазин электроники в Узбекистане. Мировые бренды, официальная гарантия и быстрая доставка. iPhone, Samsung и Xiaomi в рассрочку.",
+        title: "Velari Книги | Открытая электронная библиотека и бесплатное чтение",
+        description: "Более 150 000 шедевров узбекской и мировой литературы, учебники, художественные и бизнес-книги. Бесплатное чтение онлайн в 3D формате.",
+        ogDescription: "Крупнейшая открытая электронная библиотека. Более 150 000 книг с удобным 3D ридером и офлайн кэшем — 100% бесплатно.",
     },
 };
 
@@ -38,9 +38,9 @@ export async function generateMetadata({ params }: { params: { lang: string } })
         },
         description: t.description,
         keywords: [
-            "Velari", "velari.uz", "elektronika do'koni", "gadjetlar", "iphone narxi", "samsung narxi", 
-            "Toshkent", "O'zbekistan", "muddatli to'lov", "bo'lib to'lash", "kreditga telefon", 
-            "online shop", "internet do'kon", "arzon narxlar", "kafolatli texnika"
+            "Velari", "books.velari.uz", "kutubxona", "elektron kutubxona", "bepul kitoblar", 
+            "onlayn mutolaa", "pdf kitoblar", "uzbekcha kitoblar", "books velari", "darsliklar", 
+            "badiiy adabiyot", "biznes kitoblar", "romanlar", "3d reader", "flipbook", "elektron kitob"
         ],
         authors: [{ name: "Velari Team" }],
         creator: "Velari",
@@ -52,6 +52,7 @@ export async function generateMetadata({ params }: { params: { lang: string } })
         },
         icons: {
             icon: [
+                { url: "/favicon.svg", type: "image/svg+xml" },
                 { url: "/favicon.ico" },
                 { url: "/favicon-120x120.png", sizes: "120x120", type: "image/png" },
                 { url: "/icons/icon-192x192.png", sizes: "192x192", type: "image/png" },
@@ -62,7 +63,7 @@ export async function generateMetadata({ params }: { params: { lang: string } })
             ],
             shortcut: "/favicon.ico",
         },
-        metadataBase: new URL("https://velari.uz"),
+        metadataBase: new URL("https://books.velari.uz"),
         robots: {
             index: true,
             follow: true,
@@ -77,13 +78,13 @@ export async function generateMetadata({ params }: { params: { lang: string } })
         openGraph: {
             title: t.title,
             description: t.ogDescription,
-            siteName: "Velari",
+            siteName: "Velari Books",
             images: [
                 {
                     url: "/og-image.png",
                     width: 1200,
                     height: 630,
-                    alt: "Velari Premium Electronics Store",
+                    alt: "Velari Ochiq Elektron Kutubxonasi",
                 },
             ],
             locale: lang === "ru" ? "ru_RU" : "uz_UZ",

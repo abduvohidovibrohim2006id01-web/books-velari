@@ -1,12 +1,12 @@
 {
   "id": "/",
-  "name": "Velari Market",
-  "short_name": "Velari",
-  "description": "Premium elektronika do'koni",
+  "name": "Velari Kutubxona",
+  "short_name": "Kutubxona",
+  "description": "Ochiq elektron kutubxona va bepul mutolaa platformasi",
   "start_url": "/?utm_source=pwa",
   "display": "standalone",
-  "background_color": "#FAFAF6",
-  "theme_color": "#2D6E3E",
+  "background_color": "#0A1C14",
+  "theme_color": "#166534",
   "icons": [
     {
       "src": "/icons/icon-192x192.png",
