@@ -6,8 +6,8 @@ const FILE_CACHE = new Map<string, { fileName: string; expires: number }>();
 
 export const dynamic = "force-dynamic";
 
-// Helper: metadata orqali faylni aniqlash (Module-level to avoid TS1252 block-scoped function declaration)
-async function resolveFileNameFromMeta(identifier: string): Promise<string | null> {
+// Helper: metadata orqali faylni aniqlash (aniq kitob IDsi bo'yicha moslikni tekshiradi)
+async function resolveFileNameFromMeta(identifier: string, expectedBookId?: string): Promise<string | null> {
     try {
         const metaRes = await fetch(`https://archive.org/metadata/${encodeURIComponent(identifier)}`, {
             headers: {
@@ -25,6 +25,33 @@ async function resolveFileNameFromMeta(identifier: string): Promise<string | nul
             const format = (f.format || "").toLowerCase();
             return (format.includes("pdf") || name.endsWith(".pdf")) && !name.endsWith(".xml") && !name.endsWith(".sqlite");
         });
+
+        if (pdfFiles.length === 0) return null;
+
+        // Agar umumiy to'plamdan qidirilayotgan bo'lsa, faqat shu kitob ID siga mos faylni tanlaymiz
+        if (expectedBookId) {
+            const numMatch = expectedBookId.match(/\d+/)?.[0];
+            const matchingFile = pdfFiles.find((f: any) => {
+                const name = (f.name || "").toLowerCase();
+                return (
+                    name.startsWith(expectedBookId.toLowerCase() + "_") ||
+                    name.startsWith(expectedBookId.toLowerCase() + ".") ||
+                    (numMatch && (name.startsWith(`book-${numMatch}_`) || name.startsWith(`book-${numMatch}.`)))
+                );
+            });
+            if (matchingFile?.name) return String(matchingFile.name);
+
+            // Agar bu kitobning o'ziga xos (dedicated) itemi bo'lsa
+            if (identifier.toLowerCase().includes(expectedBookId.toLowerCase()) || (numMatch && identifier.endsWith(`-${numMatch}`))) {
+                const selected = pdfFiles.find((f: any) => f.format === "Text PDF")
+                    || pdfFiles.find((f: any) => f.source === "original" && f.name?.toLowerCase().endsWith(".pdf"))
+                    || pdfFiles[0];
+                return selected?.name ? String(selected.name) : null;
+            }
+
+            // To'plam ichida boshqa kitobning faylini qaytarib adashtirmaymiz
+            return null;
+        }
 
         const selected = pdfFiles.find((f: any) => f.format === "Text PDF")
             || pdfFiles.find((f: any) => f.source === "original" && f.name?.toLowerCase().endsWith(".pdf"))
@@ -98,14 +125,15 @@ export async function GET(
 
         // 2. Agar fayl nomi hali aniqlanmagan bo'lsa
         if (!fileName) {
+            const cacheKey = `${archiveIdentifier}_${cleanId}`;
             const now = Date.now();
-            const cached = FILE_CACHE.get(archiveIdentifier);
+            const cached = FILE_CACHE.get(cacheKey);
             if (cached && cached.expires > now) {
                 fileName = cached.fileName;
             } else {
-                fileName = await resolveFileNameFromMeta(archiveIdentifier);
+                fileName = await resolveFileNameFromMeta(archiveIdentifier, cleanId);
                 if (fileName) {
-                    FILE_CACHE.set(archiveIdentifier, {
+                    FILE_CACHE.set(cacheKey, {
                         fileName: fileName,
                         expires: now + 3600 * 1000
                     });
@@ -137,7 +165,7 @@ export async function GET(
 
         // Agar to'g'ridan-to'g'ri fayl 404 bersa, metadata orqali qayta tekshiramiz
         if (!archiveRes.ok && archiveRes.status !== 206) {
-            const metaFileName = await resolveFileNameFromMeta(archiveIdentifier);
+            const metaFileName = await resolveFileNameFromMeta(archiveIdentifier, cleanId);
             if (metaFileName && metaFileName !== fileName) {
                 fileName = metaFileName;
                 downloadUrl = `https://archive.org/download/${archiveIdentifier}/${encodeURIComponent(fileName)}`;
